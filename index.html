@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>WiFi Multi-PHY Simulator</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
+    <style>
+        /* 讓載入畫面的背景也符合我們的暗黑主題 */
+        body { background-color: #121212; color: white; margin: 0; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.js"></script>
+    <script>
+        stlite.mount({
+            requirements: ["numpy", "matplotlib"],
+            entrypoint: "app.py",
+            files: {
+                "app.py": `
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 0. Custom UI Visual Style (Dark Tech Theme)
+# ==========================================
+st.set_page_config(page_title="WiFi Multi-PHY Simulator", layout="wide")
+st.markdown("""
+<style>
+/* App Background */
+.stApp { background-color: #121212; }
+[data-testid="stSidebar"] { background-color: #1e1e1e; }
+p, h1, h2, h3, h4, h5, h6, label, .stMarkdown, .stMetricValue { color: #ffffff !important; }
+[data-testid="stMetricLabel"] > div > div > p { color: #aaaaaa !important; }
+
+/* Input Elements Background (Pure Black) */
+div[data-baseweb="select"] > div, div[data-baseweb="base-input"], input {
+    background-color: #000000 !important; color: #ffffff !important; border: 1px solid #444;
+}
+ul[role="listbox"] { background-color: #000000 !important; }
+ul[role="listbox"] li { color: #ffffff !important; }
+
+/* Slider Background */
+.stSlider div[data-baseweb="slider"] div { background-color: #000000 !important; }
+
+/* Button Style */
+.stButton > button { 
+    background-color: #222222 !important; color: #ffffff !important; 
+    border: 1px solid #555; font-weight: bold; 
+}
+.stButton > button:hover { 
+    background-color: #444444 !important; border: 1px solid #888; 
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 1. Core Parameters & RF Engine
+# ==========================================
+def get_constellation(mod_type):
+    if mod_type == "BPSK": return np.array([1, -1])
+    elif mod_type == "QPSK": return np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
+    try:
+        M = int(mod_type.split("-")[0]); L = int(np.sqrt(M))
+    except: return np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
+    points = 2 * np.arange(1, L + 1) - 1 - L
+    normalization_factor = np.sqrt(3 / (2 * (M - 1)))
+    I = points.repeat(L); Q = np.tile(points, L)
+    return (I + 1j * Q) * normalization_factor
+
+def calculate_evm_ser(rx_sym, tx_sym, constellation):
+    # 1. 計算 EVM (RMS)
+    evm_linear = np.sqrt(np.mean(np.abs(rx_sym - tx_sym)**2))
+    evm_db = 20 * np.log10(evm_linear + 1e-12)
+    
+    # 2. 計算 SER (加入記憶體優化：分塊處理 Chunking)
+    # 避免在 WebAssembly (stlite) 中瞬間產生 3GB 的超大矩陣導致 Out of Memory
+    chunk_size = 2000 
+    errors = 0
+    
+    for i in range(0, len(rx_sym), chunk_size):
+        rx_chunk = rx_sym[i : i + chunk_size]
+        tx_chunk = tx_sym[i : i + chunk_size]
+        
+        # 這樣每次最大的矩陣只會是 (2000, 4096)，記憶體佔用不到 130MB，非常安全
+        distances = np.abs(rx_chunk[:, np.newaxis] - constellation)
+        detected_syms = constellation[np.argmin(distances, axis=1)]
+        errors += np.sum(np.abs(tx_chunk - detected_syms) > 1e-5)
+        
+    return evm_db, errors / len(tx_sym)
+
+def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg):
+    g = 10 ** (iq_amp_db / 20.0)
+    theta = np.deg2rad(iq_phase_deg)
+    I = np.real(signal) * g
+    Q = np.imag(signal) / g
+    Q_skewed = Q * np.cos(theta) - I * np.sin(theta)
+    signal_iq = I + 1j * Q_skewed
+    pn_rad = np.deg2rad(phase_noise_deg)
+    phase_noise_array = np.random.randn(*signal_iq.shape) * pn_rad
+    signal_out = signal_iq * np.exp(1j * phase_noise_array)
+    return signal_out
+
+def get_ofdm_params(phy_version):
+    if phy_version == "Legacy":
+        N_FFT = 64; CP_LEN = 16
+        subcarrier_indices = np.arange(-32, 32)
+        null_indices = np.concatenate([np.arange(-32, -26), [0], np.arange(27, 32)])
+        pilot_indices = np.array([-21, -7, 7, 21])
+    else:
+        N_FFT = 256; CP_LEN = 64
+        subcarrier_indices = np.arange(-128, 128)
+        null_indices = np.concatenate([np.arange(-128, -122), [-1, 0, 1], np.arange(123, 128)])
+        pilot_indices = np.array([-116, -89, -48, -22, 22, 48, 89, 116])
+    data_indices = np.setdiff1d(subcarrier_indices, np.concatenate([pilot_indices, null_indices]))
+    return N_FFT, CP_LEN, data_indices, pilot_indices
+
+@st.cache_data(show_spinner=False)
+def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs):
+    N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
+    constellation = get_constellation(mod_type)
+    tx_symbols = np.random.choice(constellation, size=len(data_indices))
+    ofdm_freq = np.zeros(N_FFT, dtype=complex)
+    ofdm_freq[data_indices + N_FFT//2] = tx_symbols
+    ofdm_freq[pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
+    ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq)) * N_FFT
+    tx_signal_clean = np.concatenate([ofdm_time[-CP_LEN:], ofdm_time])
+    tx_impaired = apply_rf_impairments(tx_signal_clean, pn_deg, iq_amp, iq_phs)
+    papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2) / np.mean(np.abs(tx_impaired)**2))
+    sig_power = np.mean(np.abs(tx_impaired)**2)
+    noise_power = sig_power / (10**(snr_db / 10))
+    noise = np.sqrt(noise_power/2) * (np.random.randn(len(tx_impaired)) + 1j*np.random.randn(len(tx_impaired)))
+    rx_signal = tx_impaired + noise
+    rx_ofdm_time = rx_signal[CP_LEN:]
+    rx_ofdm_freq = np.fft.fftshift(np.fft.fft(rx_ofdm_time) / N_FFT)
+    rx_symbols = rx_ofdm_freq[data_indices + N_FFT//2]
+    evm, ser = calculate_evm_ser(rx_symbols, tx_symbols, constellation)
+    return tx_signal_clean, rx_signal, tx_symbols, rx_symbols, papr_db, evm, ser
+
+@st.cache_data(show_spinner=False)
+def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, pn_deg, iq_amp, iq_phs):
+    N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
+    constellation = get_constellation(mod_type)
+    tx_symbols = np.random.choice(constellation, size=(num_syms, len(data_indices)))
+    ofdm_freq = np.zeros((num_syms, N_FFT), dtype=complex)
+    ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
+    ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
+    ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs)
+    sig_power = np.mean(np.abs(tx_impaired)**2)
+    noise_power = sig_power / (10**(snr_db / 10))
+    noise = np.sqrt(noise_power/2) * (np.random.randn(*tx_impaired.shape) + 1j*np.random.randn(*tx_impaired.shape))
+    rx_time = tx_impaired + noise
+    rx_freq = np.fft.fftshift(np.fft.fft(rx_time, axis=1), axes=1) / N_FFT
+    rx_symbols_matrix = rx_freq[:, data_indices + N_FFT//2]
+    evm, ser = calculate_evm_ser(rx_symbols_matrix.flatten(), tx_symbols.flatten(), constellation)
+    return rx_symbols_matrix.flatten(), evm, ser
+
+@st.cache_data(show_spinner=False)
+def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs):
+    N_FFT, _, data_indices, pilot_indices = get_ofdm_params(phy_version)
+    constellation = get_constellation(mod_type)
+    tx_symbols = np.random.choice(constellation, size=(num_symbols_for_ccdf, len(data_indices)))
+    ofdm_freq = np.zeros((num_symbols_for_ccdf, N_FFT), dtype=complex)
+    ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
+    ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
+    ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs)
+    papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2, axis=1) / np.mean(np.abs(tx_impaired)**2, axis=1))
+    return np.sort(papr_db), 1.0 - np.arange(1, num_symbols_for_ccdf + 1) / num_symbols_for_ccdf
+
+@st.cache_data(show_spinner=False)
+def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs):
+    num_symbols = 40; barker_11 = np.array([1, -1, 1, 1, -1, 1, 1, 1, -1, -1, -1]); L_c = len(barker_11)
+    constellation = np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2) if "2 Mbps" in mod_type else np.array([1, -1])
+    tx_symbols = np.random.choice(constellation, size=num_symbols)
+    tx_waveform_clean = np.repeat(np.kron(tx_symbols, barker_11), 4)
+    tx_impaired = apply_rf_impairments(tx_waveform_clean, pn_deg, iq_amp, iq_phs)
+    sig_power = np.mean(np.abs(tx_impaired)**2)
+    noise_power = sig_power / (10**(snr_db / 10))
+    rx_waveform = tx_impaired + np.sqrt(noise_power/2) * (np.random.randn(len(tx_impaired)) + 1j*np.random.randn(len(tx_impaired)))
+    rx_chips = rx_waveform[::4]
+    rx_despread_symbols = np.sum(rx_chips.reshape(num_symbols, L_c) * barker_11, axis=1) / L_c
+    evm, ser = calculate_evm_ser(rx_despread_symbols, tx_symbols, constellation)
+    return rx_waveform, rx_chips, tx_symbols, rx_despread_symbols, evm, ser
+
+# ==========================================
+# 2. UI Sidebar Configuration
+# ==========================================
+st.sidebar.header("📡 System & Environment")
+phy_mode = st.sidebar.selectbox("PHY Architecture", [
+    "HE/EHT OFDM (WiFi 6/7) - 256 FFT",
+    "Legacy OFDM (WiFi 4/5) - 64 FFT", 
+    "DSSS (802.11b - Barker)"
+])
+
+if "OFDM" in phy_mode:
+    phy_version = "Legacy" if "Legacy" in phy_mode else "HE"
+    mod_type = st.sidebar.selectbox("Modulation Scheme", ["64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "16-QAM", "QPSK", "BPSK"] if phy_version == "HE" else ["64-QAM", "256-QAM", "16-QAM", "QPSK", "BPSK"])
+    st.sidebar.info(f"20MHz BW, 312.5 kHz SCS\\n48 Data Tones" if phy_version == "Legacy" else f"20MHz BW, 78.125 kHz SCS\\n234 Data Tones (242-tone RU)")
+    num_accumulate = st.sidebar.slider("Constellation Persistence (Syms)", min_value=1, max_value=200, value=50, step=10)
+    num_symbols_for_ccdf = 1000 
+else:
+    mod_type = st.sidebar.selectbox("Data Rate", ["1 Mbps (DBPSK)", "2 Mbps (DQPSK)"])
+    st.sidebar.info(f"22MHz Bandwidth, 11-chip Barker Code")
+
+snr_db = st.sidebar.slider("📉 Channel SNR (dB)", -10, 45, 40, step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚠️ RF Impairments Simulation")
+pn_deg = st.sidebar.slider("Phase Noise RMS (deg)", 0.0, 5.0, 0.0, step=0.1, help="Simulates LO Jitter causing rotational smearing")
+iq_amp = st.sidebar.slider("IQ Amplitude Imbalance (dB)", 0.0, 3.0, 0.0, step=0.1, help="I/Q path gain difference, causing rectangular distortion")
+iq_phs = st.sidebar.slider("IQ Phase Mismatch (deg)", 0.0, 15.0, 0.0, step=0.5, help="Mixer non-orthogonality, causing rhombic distortion")
+
+if st.sidebar.button("🚀 Regenerate Signal", use_container_width=True):
+    st.cache_data.clear()
+    st.experimental_rerun()
+
+# ==========================================
+# 3. RF Engine Execution & Dashboard Layout
+# ==========================================
+st.title(f"WiFi PHY Simulator")
+
+if "OFDM" in phy_mode:
+    N_FFT, CP_LEN, data_idx_temp, _ = get_ofdm_params(phy_version)
+    num_data_tones = len(data_idx_temp)
+    
+    tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs)
+    rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs)
+    sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs)
+    
+    time_label = f"Time Domain Envelope (N_FFT={N_FFT})"
+    time_data = np.abs(rx_signal)
+    
+    col_idx1, col_idx2, col_idx3, col_idx4 = st.columns(4)
+    col_idx1.metric("OFDM PAPR (Single)", f"{papr_db_snapshot:.2f} dB")
+    col_idx2.metric("PAPR @ 0.1%", f"{sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]:.2f} dB")
+    col_idx3.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired!" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal Hardware", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
+    col_idx4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors detected!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
+    
+    col1_1, col1_2 = st.columns(2); col2_1, col2_2 = st.columns(2)
+    
+else:
+    rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs)
+    time_label = "Rx Chips Waveform (Real/I part)"; time_data = np.real(rx_chips)
+    
+    col_idx1, col_idx2, col_idx3 = st.columns(3)
+    col_idx1.metric("DSSS Processing Gain", "10.41 dB")
+    col_idx2.metric("EVM (RMS)", f"{evm_acc:.2f} dB")
+    col_idx3.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors detected!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
+
+    col1_1, col1_2, col2_1 = st.columns(3); col2_2 = None 
+
+# Plotting Configuration
+fig_bg_color = '#1e1e1e'; grid_color = '#444444'; text_color = '#ffffff'
+plt.rcParams.update({
+    'axes.facecolor': fig_bg_color, 'figure.facecolor': fig_bg_color,
+    'text.color': text_color, 'axes.labelcolor': text_color,
+    'xtick.color': text_color, 'ytick.color': text_color, 'axes.edgecolor': grid_color
+})
+
+# --- Plot 1: Time Domain ---
+fig1, ax1 = plt.subplots(figsize=(6, 4))
+ax1.plot(time_data, color='#00aaff', linewidth=1.2)
+ax1.set_title(f'{time_label}\\n(SNR = {snr_db}dB)')
+ax1.set_xlabel('Sample / Chip Index'); ax1.set_ylabel('Amplitude')
+ax1.grid(True, color=grid_color, alpha=0.5)
+if "OFDM" in phy_mode:
+    ax1.axvspan(0, CP_LEN - 1, color='#2ca02c', alpha=0.4, label=f'CP ({CP_LEN} pts)')
+    ax1.set_ylim(bottom=0); ax1.legend(facecolor=fig_bg_color, edgecolor=grid_color)
+with col1_1: st.pyplot(fig1)
+
+# --- Plot 2: Frequency Domain (PSD) ---
+fig2, ax2 = plt.subplots(figsize=(6, 4))
+if "OFDM" in phy_mode:
+    n_plot = N_FFT * 16 
+    spectrum = np.fft.fftshift(np.fft.fft(rx_signal, n=n_plot))
+    freq_axis = np.linspace(-10, 10, n_plot); ax2.set_xlim([-15, 15])
+else:
+    spectrum = np.fft.fftshift(np.fft.fft(rx_waveform, n=2048))
+    freq_axis = np.linspace(-22, 22, 2048); ax2.set_xlim([-25, 25])
+psd_db = 20 * np.log10(np.abs(spectrum) / np.max(np.abs(spectrum)) + 1e-10)
+ax2.plot(freq_axis, psd_db, color='#ff007f')
+ax2.set_title('Frequency Domain (PSD)')
+ax2.set_xlabel('Frequency Offset (MHz)'); ax2.set_ylabel('Normalized Magnitude (dB)')
+ax2.set_ylim([-60, 5]); ax2.grid(True, color=grid_color, alpha=0.5)
+with col1_2: st.pyplot(fig2)
+
+# --- Plot 3: Constellation Diagram ---
+fig3, ax3 = plt.subplots(figsize=(6, 4))
+if "OFDM" in phy_mode:
+    full_grid = get_constellation(mod_type) 
+    ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=15, label=f'Ideal {mod_type}')
+    point_size = 4 if phy_version == "HE" else 8
+    total_pts = num_accumulate * num_data_tones
+    ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.3, s=point_size, label=f'Rx ({total_pts} pts)')
+else:
+    full_grid = np.array([1, -1]) if "1 Mbps" in mod_type else np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2)
+    ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=60, label='Ideal Grid')
+    ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.8, s=40, label='Despreaded Rx')
+ax3.axhline(0, color=grid_color, linewidth=1); ax3.axvline(0, color=grid_color, linewidth=1)
+ax3.set_title('Rx Constellation Diagram')
+ax3.set_xlabel('In-Phase (I)'); ax3.set_ylabel('Quadrature (Q)')
+ax3.legend(loc='upper right', fontsize='small', facecolor=fig_bg_color, edgecolor=grid_color)
+ax3.grid(True, color=grid_color, alpha=0.5)
+with col2_1: st.pyplot(fig3)
+
+# --- Plot 4: PAPR Statistics (CCDF) ---
+if col2_2:
+    fig4, ax4 = plt.subplots(figsize=(6, 4))
+    ax4.semilogy(sorted_papr_db, ccdf_y, color='#00ff00', linewidth=2, label='Measured CCDF')
+    ax4.axhline(1e-2, color='#aaaaaa', linestyle='--')
+    ax4.axhline(1e-3, color='#aaaaaa', linestyle='-.', alpha=0.5)
+    papr_at_pt1 = sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]
+    ax4.axvline(papr_at_pt1, color='#ffffff', linestyle=':', alpha=0.7)
+    ax4.text(papr_at_pt1 + 0.1, 2e-3, f'PAPR @ 0.1%: {papr_at_pt1:.1f} dB', rotation=90, color='#ffffff')
+    ax4.set_title(f'PAPR CCDF (N_FFT={N_FFT}, {num_symbols_for_ccdf} Syms)')
+    ax4.set_xlabel('PAPR [dB]'); ax4.set_ylabel('P(PAPR > PAPR_dB) [Probability]')
+    ax4.set_ylim([1/num_symbols_for_ccdf, 1.2])
+    ax4.grid(True, which="both", axis="both", color=grid_color, alpha=0.5)
+    ax4.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
+    with col2_2: st.pyplot(fig4)
+`
+            }
+        }, document.getElementById("root"));
+    </script>
+</body>
+</html>
