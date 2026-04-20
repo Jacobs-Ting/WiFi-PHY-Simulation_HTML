@@ -4,16 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <title>WiFi Multi-PHY Simulator</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.css" />
     <style>
-        /* 讓載入畫面的背景也符合我們的暗黑主題 */
         body { background-color: #121212; color: white; margin: 0; }
     </style>
 </head>
 <body>
     <div id="root"></div>
     
-    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.39.0/build/stlite.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.js"></script>
     <script>
         stlite.mount({
             requirements: ["numpy", "matplotlib"],
@@ -23,6 +22,7 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 # ==========================================
 # 0. Custom UI Visual Style (Dark Tech Theme)
@@ -30,30 +30,23 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="WiFi Multi-PHY Simulator", layout="wide")
 st.markdown("""
 <style>
-/* App Background */
 .stApp { background-color: #121212; }
 [data-testid="stSidebar"] { background-color: #1e1e1e; }
 p, h1, h2, h3, h4, h5, h6, label, .stMarkdown, .stMetricValue { color: #ffffff !important; }
 [data-testid="stMetricLabel"] > div > div > p { color: #aaaaaa !important; }
-
-/* Input Elements Background (Pure Black) */
 div[data-baseweb="select"] > div, div[data-baseweb="base-input"], input {
     background-color: #000000 !important; color: #ffffff !important; border: 1px solid #444;
 }
 ul[role="listbox"] { background-color: #000000 !important; }
 ul[role="listbox"] li { color: #ffffff !important; }
-
-/* Slider Background */
 .stSlider div[data-baseweb="slider"] div { background-color: #000000 !important; }
-
-/* Button Style */
 .stButton > button { 
     background-color: #222222 !important; color: #ffffff !important; 
     border: 1px solid #555; font-weight: bold; 
 }
-.stButton > button:hover { 
-    background-color: #444444 !important; border: 1px solid #888; 
-}
+.stButton > button:hover { background-color: #444444 !important; border: 1px solid #888; }
+button[data-baseweb="tab"] { background-color: #1e1e1e; color: #aaa; border-radius: 4px 4px 0 0; margin-right: 2px; }
+button[data-baseweb="tab"][aria-selected="true"] { background-color: #00aaff; color: #fff !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,25 +64,21 @@ def get_constellation(mod_type):
     I = points.repeat(L); Q = np.tile(points, L)
     return (I + 1j * Q) * normalization_factor
 
+def get_mod_bits(mod_type):
+    mapping = {"BPSK": 1, "QPSK": 2, "16-QAM": 4, "64-QAM": 6, "256-QAM": 8, "1024-QAM": 10, "4096-QAM": 12}
+    return mapping.get(mod_type, 2)
+
 def calculate_evm_ser(rx_sym, tx_sym, constellation):
-    # 1. 計算 EVM (RMS)
     evm_linear = np.sqrt(np.mean(np.abs(rx_sym - tx_sym)**2))
     evm_db = 20 * np.log10(evm_linear + 1e-12)
-    
-    # 2. 計算 SER (加入記憶體優化：分塊處理 Chunking)
-    # 避免在 WebAssembly (stlite) 中瞬間產生 3GB 的超大矩陣導致 Out of Memory
     chunk_size = 2000 
     errors = 0
-    
     for i in range(0, len(rx_sym), chunk_size):
         rx_chunk = rx_sym[i : i + chunk_size]
         tx_chunk = tx_sym[i : i + chunk_size]
-        
-        # 這樣每次最大的矩陣只會是 (2000, 4096)，記憶體佔用不到 130MB，非常安全
         distances = np.abs(rx_chunk[:, np.newaxis] - constellation)
         detected_syms = constellation[np.argmin(distances, axis=1)]
         errors += np.sum(np.abs(tx_chunk - detected_syms) > 1e-5)
-        
     return evm_db, errors / len(tx_sym)
 
 def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg):
@@ -190,71 +179,31 @@ def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs):
 # ==========================================
 # 2. UI Sidebar Configuration
 # ==========================================
-st.sidebar.header("📡 System & Environment")
-phy_mode = st.sidebar.selectbox("PHY Architecture", [
-    "HE/EHT OFDM (WiFi 6/7) - 256 FFT",
-    "Legacy OFDM (WiFi 4/5) - 64 FFT", 
-    "DSSS (802.11b - Barker)"
+st.sidebar.header("📡 Global Settings")
+st.sidebar.markdown("---")
+st.sidebar.header("⚠️ RF Impairments")
+pn_deg = st.sidebar.slider("Phase Noise RMS (deg)", 0.0, 5.0, 0.0, step=0.1)
+iq_amp = st.sidebar.slider("IQ Amplitude Imbalance (dB)", 0.0, 3.0, 0.0, step=0.1)
+iq_phs = st.sidebar.slider("IQ Phase Mismatch (deg)", 0.0, 15.0, 0.0, step=0.5)
+
+if st.sidebar.button("🚀 Clear Cache & Rerun", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun() 
+
+# ==========================================
+# 3. Main Dashboard: Tabbed Interface
+# ==========================================
+st.title(f"WiFi PHY & MAC Simulator")
+
+# Tabs Creation
+tab_single, tab_mlo, tab_waterfall, tab_hw = st.tabs([
+    "📡 Single-Link PHY", 
+    "🚀 WiFi 7 MLO (Aggregation)", 
+    "🌊 Time-Frequency Waterfall",
+    "⚙️ Hardware Arch (STR/NSTR)"
 ])
 
-if "OFDM" in phy_mode:
-    phy_version = "Legacy" if "Legacy" in phy_mode else "HE"
-    mod_type = st.sidebar.selectbox("Modulation Scheme", ["64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "16-QAM", "QPSK", "BPSK"] if phy_version == "HE" else ["64-QAM", "256-QAM", "16-QAM", "QPSK", "BPSK"])
-    st.sidebar.info(f"20MHz BW, 312.5 kHz SCS\\n48 Data Tones" if phy_version == "Legacy" else f"20MHz BW, 78.125 kHz SCS\\n234 Data Tones (242-tone RU)")
-    num_accumulate = st.sidebar.slider("Constellation Persistence (Syms)", min_value=1, max_value=200, value=50, step=10)
-    num_symbols_for_ccdf = 1000 
-else:
-    mod_type = st.sidebar.selectbox("Data Rate", ["1 Mbps (DBPSK)", "2 Mbps (DQPSK)"])
-    st.sidebar.info(f"22MHz Bandwidth, 11-chip Barker Code")
-
-snr_db = st.sidebar.slider("📉 Channel SNR (dB)", -10, 45, 40, step=1)
-
-st.sidebar.markdown("---")
-st.sidebar.header("⚠️ RF Impairments Simulation")
-pn_deg = st.sidebar.slider("Phase Noise RMS (deg)", 0.0, 5.0, 0.0, step=0.1, help="Simulates LO Jitter causing rotational smearing")
-iq_amp = st.sidebar.slider("IQ Amplitude Imbalance (dB)", 0.0, 3.0, 0.0, step=0.1, help="I/Q path gain difference, causing rectangular distortion")
-iq_phs = st.sidebar.slider("IQ Phase Mismatch (deg)", 0.0, 15.0, 0.0, step=0.5, help="Mixer non-orthogonality, causing rhombic distortion")
-
-if st.sidebar.button("🚀 Regenerate Signal", use_container_width=True):
-    st.cache_data.clear()
-    st.experimental_rerun()
-
-# ==========================================
-# 3. RF Engine Execution & Dashboard Layout
-# ==========================================
-st.title(f"WiFi PHY Simulator")
-
-if "OFDM" in phy_mode:
-    N_FFT, CP_LEN, data_idx_temp, _ = get_ofdm_params(phy_version)
-    num_data_tones = len(data_idx_temp)
-    
-    tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs)
-    rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs)
-    sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs)
-    
-    time_label = f"Time Domain Envelope (N_FFT={N_FFT})"
-    time_data = np.abs(rx_signal)
-    
-    col_idx1, col_idx2, col_idx3, col_idx4 = st.columns(4)
-    col_idx1.metric("OFDM PAPR (Single)", f"{papr_db_snapshot:.2f} dB")
-    col_idx2.metric("PAPR @ 0.1%", f"{sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]:.2f} dB")
-    col_idx3.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired!" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal Hardware", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
-    col_idx4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors detected!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
-    
-    col1_1, col1_2 = st.columns(2); col2_1, col2_2 = st.columns(2)
-    
-else:
-    rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs)
-    time_label = "Rx Chips Waveform (Real/I part)"; time_data = np.real(rx_chips)
-    
-    col_idx1, col_idx2, col_idx3 = st.columns(3)
-    col_idx1.metric("DSSS Processing Gain", "10.41 dB")
-    col_idx2.metric("EVM (RMS)", f"{evm_acc:.2f} dB")
-    col_idx3.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors detected!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
-
-    col1_1, col1_2, col2_1 = st.columns(3); col2_2 = None 
-
-# Plotting Configuration
+# Global Plot Styling
 fig_bg_color = '#1e1e1e'; grid_color = '#444444'; text_color = '#ffffff'
 plt.rcParams.update({
     'axes.facecolor': fig_bg_color, 'figure.facecolor': fig_bg_color,
@@ -262,67 +211,371 @@ plt.rcParams.update({
     'xtick.color': text_color, 'ytick.color': text_color, 'axes.edgecolor': grid_color
 })
 
-# --- Plot 1: Time Domain ---
-fig1, ax1 = plt.subplots(figsize=(6, 4))
-ax1.plot(time_data, color='#00aaff', linewidth=1.2)
-ax1.set_title(f'{time_label}\\n(SNR = {snr_db}dB)')
-ax1.set_xlabel('Sample / Chip Index'); ax1.set_ylabel('Amplitude')
-ax1.grid(True, color=grid_color, alpha=0.5)
-if "OFDM" in phy_mode:
-    ax1.axvspan(0, CP_LEN - 1, color='#2ca02c', alpha=0.4, label=f'CP ({CP_LEN} pts)')
-    ax1.set_ylim(bottom=0); ax1.legend(facecolor=fig_bg_color, edgecolor=grid_color)
-with col1_1: st.pyplot(fig1)
+# ---------------------------------------------------------
+# Tab 1: Single-Link PHY Analyzer
+# ---------------------------------------------------------
+with tab_single:
+    col_ctrl, col_plot = st.columns([1, 4])
+    
+    with col_ctrl:
+        st.subheader("Link Parameters")
+        phy_mode = st.selectbox("PHY Architecture", [
+            "HE/EHT OFDM (WiFi 6/7)", 
+            "Legacy OFDM (WiFi 4/5)", 
+            "DSSS (802.11b - Barker)"
+        ])
+        
+        if "OFDM" in phy_mode:
+            phy_version = "Legacy" if "Legacy" in phy_mode else "HE"
+            mod_type = st.selectbox("Modulation Scheme", ["64-QAM", "256-QAM", "1024-QAM", "4096-QAM", "16-QAM", "QPSK", "BPSK"] if phy_version == "HE" else ["64-QAM", "256-QAM", "16-QAM", "QPSK", "BPSK"])
+            num_accumulate = st.slider("Constellation Syms", 1, 200, 50, 10)
+            snr_db = st.slider("Channel SNR (dB)", -10, 45, 40, 1)
+            num_symbols_for_ccdf = 1000
+        else:
+            mod_type = st.selectbox("Data Rate", ["1 Mbps (DBPSK)", "2 Mbps (DQPSK)"])
+            snr_db = st.slider("Channel SNR (dB)", -10, 45, 40, 1)
 
-# --- Plot 2: Frequency Domain (PSD) ---
-fig2, ax2 = plt.subplots(figsize=(6, 4))
-if "OFDM" in phy_mode:
-    n_plot = N_FFT * 16 
-    spectrum = np.fft.fftshift(np.fft.fft(rx_signal, n=n_plot))
-    freq_axis = np.linspace(-10, 10, n_plot); ax2.set_xlim([-15, 15])
-else:
-    spectrum = np.fft.fftshift(np.fft.fft(rx_waveform, n=2048))
-    freq_axis = np.linspace(-22, 22, 2048); ax2.set_xlim([-25, 25])
-psd_db = 20 * np.log10(np.abs(spectrum) / np.max(np.abs(spectrum)) + 1e-10)
-ax2.plot(freq_axis, psd_db, color='#ff007f')
-ax2.set_title('Frequency Domain (PSD)')
-ax2.set_xlabel('Frequency Offset (MHz)'); ax2.set_ylabel('Normalized Magnitude (dB)')
-ax2.set_ylim([-60, 5]); ax2.grid(True, color=grid_color, alpha=0.5)
-with col1_2: st.pyplot(fig2)
+    with col_plot:
+        if "OFDM" in phy_mode:
+            N_FFT, CP_LEN, data_idx_temp, _ = get_ofdm_params(phy_version)
+            tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs)
+            rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs)
+            sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs)
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("OFDM PAPR", f"{papr_db_snapshot:.2f} dB")
+            c2.metric("PAPR @ 0.1%", f"{sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]:.2f} dB")
+            c3.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
+            c4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
+            
+            plot1, plot2 = st.columns(2); plot3, plot4 = st.columns(2)
+            
+            fig1, ax1 = plt.subplots(figsize=(5, 3))
+            ax1.plot(np.abs(rx_signal), color='#00aaff', linewidth=1.2)
+            ax1.set_title('Time Domain Envelope')
+            ax1.grid(True, color=grid_color, alpha=0.5)
+            with plot1: st.pyplot(fig1)
 
-# --- Plot 3: Constellation Diagram ---
-fig3, ax3 = plt.subplots(figsize=(6, 4))
-if "OFDM" in phy_mode:
-    full_grid = get_constellation(mod_type) 
-    ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=15, label=f'Ideal {mod_type}')
-    point_size = 4 if phy_version == "HE" else 8
-    total_pts = num_accumulate * num_data_tones
-    ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.3, s=point_size, label=f'Rx ({total_pts} pts)')
-else:
-    full_grid = np.array([1, -1]) if "1 Mbps" in mod_type else np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2)
-    ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=60, label='Ideal Grid')
-    ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.8, s=40, label='Despreaded Rx')
-ax3.axhline(0, color=grid_color, linewidth=1); ax3.axvline(0, color=grid_color, linewidth=1)
-ax3.set_title('Rx Constellation Diagram')
-ax3.set_xlabel('In-Phase (I)'); ax3.set_ylabel('Quadrature (Q)')
-ax3.legend(loc='upper right', fontsize='small', facecolor=fig_bg_color, edgecolor=grid_color)
-ax3.grid(True, color=grid_color, alpha=0.5)
-with col2_1: st.pyplot(fig3)
+            fig2, ax2 = plt.subplots(figsize=(5, 3))
+            n_plot = N_FFT * 8 
+            spectrum = np.fft.fftshift(np.fft.fft(rx_signal, n=n_plot))
+            freq_axis = np.linspace(-10, 10, n_plot); ax2.set_xlim([-15, 15])
+            psd_db = 20 * np.log10(np.abs(spectrum) / np.max(np.abs(spectrum)) + 1e-10)
+            ax2.plot(freq_axis, psd_db, color='#ff007f')
+            ax2.set_title('Frequency Domain (PSD)')
+            ax2.set_ylim([-60, 5]); ax2.grid(True, color=grid_color, alpha=0.5)
+            with plot2: st.pyplot(fig2)
 
-# --- Plot 4: PAPR Statistics (CCDF) ---
-if col2_2:
-    fig4, ax4 = plt.subplots(figsize=(6, 4))
-    ax4.semilogy(sorted_papr_db, ccdf_y, color='#00ff00', linewidth=2, label='Measured CCDF')
-    ax4.axhline(1e-2, color='#aaaaaa', linestyle='--')
-    ax4.axhline(1e-3, color='#aaaaaa', linestyle='-.', alpha=0.5)
-    papr_at_pt1 = sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]
-    ax4.axvline(papr_at_pt1, color='#ffffff', linestyle=':', alpha=0.7)
-    ax4.text(papr_at_pt1 + 0.1, 2e-3, f'PAPR @ 0.1%: {papr_at_pt1:.1f} dB', rotation=90, color='#ffffff')
-    ax4.set_title(f'PAPR CCDF (N_FFT={N_FFT}, {num_symbols_for_ccdf} Syms)')
-    ax4.set_xlabel('PAPR [dB]'); ax4.set_ylabel('P(PAPR > PAPR_dB) [Probability]')
-    ax4.set_ylim([1/num_symbols_for_ccdf, 1.2])
-    ax4.grid(True, which="both", axis="both", color=grid_color, alpha=0.5)
-    ax4.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
-    with col2_2: st.pyplot(fig4)
+            fig3, ax3 = plt.subplots(figsize=(5, 3))
+            full_grid = get_constellation(mod_type) 
+            ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=15)
+            pt_size = 2 if phy_version == "HE" else 8
+            ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.3, s=pt_size)
+            ax3.axhline(0, color=grid_color); ax3.axvline(0, color=grid_color)
+            ax3.set_title('Rx Constellation Diagram')
+            ax3.grid(True, color=grid_color, alpha=0.5)
+            with plot3: st.pyplot(fig3)
+
+            fig4, ax4 = plt.subplots(figsize=(5, 3))
+            ax4.semilogy(sorted_papr_db, ccdf_y, color='#00ff00', linewidth=2)
+            ax4.axhline(1e-2, color='#aaaaaa', linestyle='--'); ax4.axhline(1e-3, color='#aaaaaa', linestyle='-.', alpha=0.5)
+            ax4.set_title('PAPR CCDF')
+            ax4.set_ylim([1/num_symbols_for_ccdf, 1.2])
+            ax4.grid(True, which="both", axis="both", color=grid_color, alpha=0.5)
+            with plot4: st.pyplot(fig4)
+            
+        else:
+            rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs)
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Processing Gain", "10.41 dB")
+            c2.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
+            c3.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
+            c4.write("")
+            
+            plot1, plot2 = st.columns(2); plot3, plot4 = st.columns(2)
+            
+            fig1, ax1 = plt.subplots(figsize=(5, 3))
+            ax1.plot(np.real(rx_chips), color='#00aaff', linewidth=1.2)
+            ax1.set_title('Rx Chips Waveform (Real part)')
+            ax1.grid(True, color=grid_color, alpha=0.5)
+            with plot1: st.pyplot(fig1)
+
+            fig2, ax2 = plt.subplots(figsize=(5, 3))
+            spectrum = np.fft.fftshift(np.fft.fft(rx_waveform, n=2048))
+            freq_axis = np.linspace(-22, 22, 2048)
+            psd_db = 20 * np.log10(np.abs(spectrum) / np.max(np.abs(spectrum)) + 1e-10)
+            ax2.plot(freq_axis, psd_db, color='#ff007f')
+            ax2.set_xlim([-25, 25]); ax2.set_ylim([-60, 5])
+            ax2.set_title('Frequency Domain (PSD)')
+            ax2.grid(True, color=grid_color, alpha=0.5)
+            with plot2: st.pyplot(fig2)
+
+            fig3, ax3 = plt.subplots(figsize=(5, 3))
+            full_grid = np.array([1, -1]) if "1 Mbps" in mod_type else np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2)
+            ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=60)
+            ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.8, s=40)
+            ax3.axhline(0, color=grid_color); ax3.axvline(0, color=grid_color)
+            ax3.set_title('Rx Constellation Diagram')
+            ax3.grid(True, color=grid_color, alpha=0.5)
+            with plot3: st.pyplot(fig3)
+
+# ---------------------------------------------------------
+# Tab 2: WiFi 7 MLO (Bandwidth Aggregation Demo)
+# ---------------------------------------------------------
+with tab_mlo:
+    st.markdown("### Multi-Link Operation (Bandwidth Aggregation Demo)")
+    st.markdown("Simulate a WiFi 7 device establishing physical links simultaneously in 5GHz and 6GHz bands, seamlessly aggregating the data layer.")
+    col_link1, col_link2 = st.columns(2)
+    with col_link1:
+        st.markdown("#### 🟢 Link 1 (5 GHz Band)")
+        l1_mod = st.selectbox("Link 1 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=1)
+        l1_snr = st.slider("Link 1 SNR (dB)", -10, 45, 35, 1, key="l1_snr")
+        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, 20, pn_deg, iq_amp, iq_phs)
+        l1_base_mbps = get_mod_bits(l1_mod) * 17.2 
+        l1_throughput = max(0, l1_base_mbps * ((1 - l1_ser) ** 5))
+        st.metric("Link 1 Throughput", f"{l1_throughput:.1f} Mbps", f"EVM: {l1_evm:.1f} dB")
+        fig_l1, ax_l1 = plt.subplots(figsize=(4, 3))
+        grid_l1 = get_constellation(l1_mod)
+        ax_l1.scatter(np.real(grid_l1), np.imag(grid_l1), color='#777777', alpha=0.2, s=5)
+        ax_l1.scatter(np.real(l1_rx_sym), np.imag(l1_rx_sym), color='#00ffcc', alpha=0.4, s=2)
+        ax_l1.axhline(0, color=grid_color); ax_l1.axvline(0, color=grid_color)
+        ax_l1.set_title(f'Link 1 Constellation ({l1_mod})')
+        st.pyplot(fig_l1)
+
+    with col_link2:
+        st.markdown("#### 🔵 Link 2 (6 GHz Band)")
+        l2_mod = st.selectbox("Link 2 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=0)
+        l2_snr = st.slider("Link 2 SNR (dB)", -10, 45, 40, 1, key="l2_snr")
+        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, 20, pn_deg, iq_amp, iq_phs)
+        l2_base_mbps = get_mod_bits(l2_mod) * 17.2 
+        l2_throughput = max(0, l2_base_mbps * ((1 - l2_ser) ** 5))
+        st.metric("Link 2 Throughput", f"{l2_throughput:.1f} Mbps", f"EVM: {l2_evm:.1f} dB")
+        fig_l2, ax_l2 = plt.subplots(figsize=(4, 3))
+        grid_l2 = get_constellation(l2_mod)
+        ax_l2.scatter(np.real(grid_l2), np.imag(grid_l2), color='#777777', alpha=0.2, s=5)
+        ax_l2.scatter(np.real(l2_rx_sym), np.imag(l2_rx_sym), color='#00aaff', alpha=0.4, s=2)
+        ax_l2.axhline(0, color=grid_color); ax_l2.axvline(0, color=grid_color)
+        ax_l2.set_title(f'Link 2 Constellation ({l2_mod})')
+        st.pyplot(fig_l2)
+        
+    st.markdown("---")
+    total_throughput = l1_throughput + l2_throughput
+    st.markdown(f"<h2 style='text-align: center; color: #ff007f;'>🚀 Aggregated MLO Throughput: {total_throughput:.1f} Mbps</h2>", unsafe_allow_html=True)
+    fig_bar, ax_bar = plt.subplots(figsize=(10, 1.5))
+    ax_bar.barh([0], [l1_throughput], color='#00ffcc', label='Link 1 (5GHz)')
+    ax_bar.barh([0], [l2_throughput], left=[l1_throughput], color='#00aaff', label='Link 2 (6GHz)')
+    ax_bar.set_xlim([0, 500]) 
+    ax_bar.set_yticks([]); ax_bar.set_xlabel("Throughput (Mbps)")
+    ax_bar.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
+    st.pyplot(fig_bar)
+
+# ---------------------------------------------------------
+# Tab 3: MLO Time-Frequency Waterfall
+# ---------------------------------------------------------
+with tab_waterfall:
+    st.markdown("### Time-Frequency Waterfall (Dynamic Scheduling & Interference Mitigation)")
+    st.markdown("Observe how packets dynamically interleave across bands. Adding 2.4GHz highlights the ultimate cross-band scheduling capability of WiFi 7 **Tri-Band MLO**!")
+
+    col_w1, col_w2 = st.columns([1, 4])
+    with col_w1:
+        st.subheader("MAC Scheduler Settings")
+        wf_mode = st.radio("Operating Mode", [
+            "Legacy (Single Band 5GHz)", 
+            "WiFi 7 MLO (5GHz + 6GHz)",
+            "WiFi 7 Tri-Band MLO (2.4 + 5 + 6GHz)"
+        ])
+        wf_interference = st.checkbox("⚠️ Trigger 5GHz DFS Radar Interference", value=False)
+        wf_load = st.slider("Traffic Load (%)", 10, 100, 80, 10)
+
+    with col_w2:
+        fig_wf, ax_wf = plt.subplots(figsize=(10, 4.5))
+        ax_wf.set_ylim(-0.5, 2.5)
+        ax_wf.set_xlim(0, 100)
+        ax_wf.set_yticks([0, 1, 2])
+        ax_wf.set_yticklabels(['2.4 GHz\\n(IoT / Link 3)', '5 GHz\\n(Primary Link 1)', '6 GHz\\n(High Speed Link 2)'], color=text_color)
+        ax_wf.set_xlabel('Time (ms)', color=text_color)
+        
+        np.random.seed(int(wf_load) + (100 if wf_interference else 0) + (1000 if "MLO" in wf_mode else 0) + (500 if "Tri-Band" in wf_mode else 0))
+
+        t = 0
+        while t < 100:
+            gap = np.random.randint(1, max(2, int(10 - wf_load/10)))
+            t += gap
+            if t >= 100: break
+            
+            pkt_duration = np.random.randint(3, 8)
+            
+            if "Tri-Band" in wf_mode:
+                valid_bands = [0, 2] if (wf_interference and t > 40) else [0, 1, 2]
+            elif "MLO" in wf_mode:
+                valid_bands = [2] if (wf_interference and t > 40) else [1, 2]
+            else:
+                valid_bands = [1]
+            
+            is_dropped = False
+            if wf_mode == "Legacy (Single Band 5GHz)" and wf_interference and t > 40:
+                band = 1
+                is_dropped = True
+            else:
+                band = np.random.choice(valid_bands)
+
+            colors = {0: '#ffaa00', 1: '#00ffcc', 2: '#00aaff'}
+            
+            if is_dropped:
+                fail_rect = patches.Rectangle((t, band - 0.3), 2, 0.6, facecolor='#ff0000', edgecolor='#1e1e1e', alpha=0.5, hatch='//')
+                ax_wf.add_patch(fail_rect)
+                actual_duration = 2
+            else:
+                actual_duration = pkt_duration * 1.5 if band == 0 else pkt_duration
+                rect = patches.Rectangle((t, band - 0.3), actual_duration, 0.6, facecolor=colors[band], edgecolor='#1e1e1e', alpha=0.9)
+                ax_wf.add_patch(rect)
+
+                if "MLO" in wf_mode and np.random.rand() > 0.4 and len(valid_bands) > 1:
+                    other_bands = [b for b in valid_bands if b != band]
+                    other_band = np.random.choice(other_bands)
+                    other_duration = pkt_duration * 1.5 if other_band == 0 else pkt_duration
+                    rect2 = patches.Rectangle((t, other_band - 0.3), other_duration, 0.6, facecolor=colors[other_band], edgecolor='#1e1e1e', alpha=0.8)
+                    ax_wf.add_patch(rect2)
+            
+            t += actual_duration
+
+        if wf_interference:
+            ax_wf.axvspan(40, 100, ymin=0.35, ymax=0.65, color='#ff0000', alpha=0.3, hatch='\\\\', label='DFS Radar Interference')
+            ax_wf.text(70, 1, 'DFS Radar Detected\\n(Channel Blocked)', color='#ffffff', ha='center', va='center', fontweight='bold', fontsize=12, bbox=dict(facecolor='#1e1e1e', alpha=0.8, edgecolor='none'))
+
+        ax_wf.grid(True, axis='x', color=grid_color, alpha=0.5)
+        ax_wf.grid(False, axis='y')
+        ax_wf.spines['top'].set_visible(False)
+        ax_wf.spines['right'].set_visible(False)
+        ax_wf.spines['left'].set_visible(False)
+        
+        custom_lines = [
+            patches.Patch(color='#ffaa00', label='2.4GHz Data'),
+            patches.Patch(color='#00ffcc', label='5GHz Data'),
+            patches.Patch(color='#00aaff', label='6GHz Data'),
+            patches.Patch(facecolor='#ff0000', alpha=0.5, hatch='//', label='Dropped Packet')
+        ]
+        ax_wf.legend(handles=custom_lines, loc='upper left', facecolor=fig_bg_color, edgecolor=grid_color, ncol=2)
+        st.pyplot(fig_wf)
+
+# ---------------------------------------------------------
+# Tab 4: Hardware Arch (IDC Isolation Budget Calculator)
+# ---------------------------------------------------------
+with tab_hw:
+    st.markdown("### Hardware Architecture: IDC Isolation Budget Calculator")
+    st.markdown("Evaluate the physical isolation required for different device form factors to achieve **STR (Simultaneous Transmit and Receive)** in WiFi 7 MLO.")
+
+    col_ctrl1, col_ctrl2 = st.columns(2)
+    
+    with col_ctrl1:
+        st.subheader("1. Device Form Factor")
+        device_type = st.radio("Select Device Form Factor:", ["📱 Smartphone (Client/STA)", "📡 Access Point (Router)"])
+        
+        if "Smartphone" in device_type:
+            st.info("📌 **Smartphone Constraint:** Extremely limited internal space requires a 'Shared Antenna', resulting in 0 dB spatial isolation. It relies entirely on high-end filters for band separation.")
+        else:
+            st.info("📌 **Router Advantage:** Allows for spatial separation of antennas and metal shielding cans, significantly reducing reliance on expensive filters.")
+
+    with col_ctrl2:
+        st.subheader("2. Isolation Components")
+        total_iso = 0
+        if "Smartphone" in device_type:
+            spatial_iso = 0
+            shield_iso = 0
+            filter_iso = st.slider("Triplexer / BAW Filter Isolation (dB)", 10, 60, 20, 1, help="Isolation from high-end Triplexer/BAW filter")
+            total_iso = spatial_iso + filter_iso
+        else:
+            spatial_iso = st.slider("Antenna Spatial Isolation (dB)", 10, 40, 20, 1, help="Physical isolation from antenna separation")
+            shielding = st.checkbox("Add Metal Shielding Can (+15 dB)", value=False)
+            shield_iso = 15 if shielding else 0
+            filter_iso = st.slider("Basic Diplexer / Filter Isolation (dB)", 10, 40, 15, 1, help="Standard diplexer or low-end filter isolation")
+            total_iso = spatial_iso + shield_iso + filter_iso
+    
+    threshold = 45 
+    is_str = total_iso >= threshold
+    
+    st.markdown("---")
+    
+    col_res1, col_res2 = st.columns([1, 2])
+    with col_res1:
+        st.metric("Total System Isolation", f"{total_iso} dB", 
+                  f"{total_iso - threshold} dB" if is_str else f"{total_iso - threshold} dB (Insufficient)", 
+                  delta_color="normal" if is_str else "inverse")
+    with col_res2:
+        if is_str:
+            st.success("✅ **STR Achieved!** Total isolation target met (>= 45 dB). Supports WiFi 7 MLO dual-band high-speed simultaneous Tx/Rx.")
+        else:
+            st.error("🚨 **NSTR Limited!** Insufficient isolation. Massive leakage causes receiver desense. System downgraded to Non-STR (Cannot Tx and Rx simultaneously).")
+
+    st.markdown("### System Architecture Diagram")
+    
+    fig_hw, ax_hw = plt.subplots(figsize=(14, 7), dpi=150)
+    ax_hw.set_xlim(0, 12); ax_hw.set_ylim(0, 8.5)
+    ax_hw.axis('off')
+
+    ax_hw.text(6, 7.8, 'Total IDC Isolation Budget (Target: 45 dB)', color='white', ha='center', fontsize=16, fontweight='bold')
+    ax_hw.barh([7.0], [80], color='#333333', height=0.6, left=2)
+    ax_hw.barh([7.0], [min(total_iso, 80)], color='#2ca02c' if is_str else '#ff0000', height=0.6, left=2)
+    ax_hw.axvline(2 + 45, ymin=0.8, ymax=0.88, color='white', linestyle='--', lw=2)
+    ax_hw.text(2 + 45, 7.4, 'STR Threshold (45dB)', color='white', ha='center', fontsize=12)
+    ax_hw.text(2 + min(total_iso, 80) - 1, 7.0, f'{total_iso} dB', color='white', ha='right', va='center', fontweight='bold', fontsize=14)
+
+    mac_rect = patches.Rectangle((1.5, 1), 2.5, 4.5, facecolor='#333333', edgecolor=grid_color, lw=2)
+    ax_hw.add_patch(mac_rect)
+    ax_hw.text(2.75, 3.25, 'Unified\\nMAC Layer', color='white', ha='center', va='center', fontweight='bold', fontsize=14)
+
+    phy1_rect = patches.Rectangle((5, 4.0), 2.5, 1.5, facecolor='#00ffcc', alpha=0.3, edgecolor='#00ffcc', lw=2)
+    ax_hw.add_patch(phy1_rect)
+    ax_hw.text(6.25, 4.75, 'PHY 1 (5GHz)\\nTx Transmitting', color='white', ha='center', va='center', fontweight='bold', fontsize=12)
+
+    phy2_color = '#00aaff' if is_str else '#555555'
+    phy2_rect = patches.Rectangle((5, 1), 2.5, 1.5, facecolor=phy2_color, alpha=0.3, edgecolor=phy2_color, lw=2)
+    ax_hw.add_patch(phy2_rect)
+    ax_hw.text(6.25, 1.75, 'PHY 2 (6GHz)\\nRx Receiving', color='white' if is_str else '#ff0000', ha='center', va='center', fontweight='bold', fontsize=12)
+
+    if "Smartphone" in device_type:
+        ax_hw.plot([7.5, 9.0], [4.75, 3.25], color=grid_color, lw=2)
+        ax_hw.plot([7.5, 9.0], [1.75, 3.25], color=grid_color, lw=2)
+        
+        trip_color = '#2ca02c' if is_str else '#ffaa00'
+        trip_rect = patches.Rectangle((8.6, 2.75), 1.0, 1, facecolor=trip_color, edgecolor='#1e1e1e', alpha=0.9)
+        ax_hw.add_patch(trip_rect)
+        ax_hw.text(9.1, 3.25, f'Triplexer\\n({filter_iso}dB)', color='white', ha='center', va='center', fontsize=11, fontweight='bold')
+        
+        ax_hw.plot([9.6, 10.5], [3.25, 3.25], color=grid_color, lw=2)
+        ax_hw.plot([10.5, 10.5], [2.25, 4.25], color=grid_color, lw=4)
+        ax_hw.text(10.8, 3.25, 'Shared\\nAntenna', color='white', va='center', fontsize=13)
+
+        if not is_str:
+            ax_hw.annotate('', xy=(6.8, 2.5), xytext=(6.8, 4.0), arrowprops=dict(edgecolor='#ff0000', facecolor='#ff0000', shrink=0.1, width=5, headwidth=15, ls='dashed'))
+            ax_hw.text(7.1, 3.25, 'Leakage\\n(Deafened)', color='#ff0000', ha='left', va='center', fontweight='bold', fontsize=13)
+
+    else:
+        ax_hw.plot([7.5, 9.0], [4.75, 4.75], color=grid_color, lw=2)
+        ax_hw.plot([9.0, 9.0], [4.0, 5.5], color=grid_color, lw=4)
+        ax_hw.plot([7.5, 9.0], [1.75, 1.75], color=grid_color, lw=2)
+        ax_hw.plot([9.0, 9.0], [1.0, 2.5], color=grid_color, lw=4)
+        ax_hw.text(9.4, 4.75, 'Antenna 1', color='white', va='center', fontsize=13)
+        ax_hw.text(9.4, 1.75, 'Antenna 2', color='white', va='center', fontsize=13)
+        
+        ax_hw.annotate('', xy=(9, 2.7), xytext=(9, 3.8), arrowprops=dict(arrowstyle='<->', color='#aaaaaa', lw=2))
+        ax_hw.text(9.4, 3.25, f'Spatial Isolation\\n({spatial_iso}dB)', color='#aaaaaa', va='center', fontsize=12)
+
+        if shielding:
+            shield_rect = patches.Rectangle((4.7, 0.5), 3.0, 5.3, facecolor='none', edgecolor='#aaaaaa', lw=2, linestyle='-.')
+            ax_hw.add_patch(shield_rect)
+            ax_hw.text(6.2, 6.0, 'Metal Shielding Can (+15dB)', color='#aaaaaa', ha='center', fontsize=13)
+
+        filter_rect = patches.Rectangle((7.8, 1.5), 0.5, 0.5, facecolor='#00aaff', alpha=0.5)
+        ax_hw.add_patch(filter_rect)
+        ax_hw.text(8.05, 1.0, f'Filter\\n({filter_iso}dB)', color='white', ha='center', fontsize=11)
+
+        if not is_str:
+            ax_hw.annotate('', xy=(8.5, 2.7), xytext=(8.5, 3.8), arrowprops=dict(edgecolor='#ff0000', facecolor='#ff0000', shrink=0.1, width=5, headwidth=15, ls='dashed'))
+            ax_hw.text(8.2, 3.25, 'Leakage', color='#ff0000', ha='right', va='center', fontweight='bold', fontsize=13)
+
+    st.pyplot(fig_hw, use_container_width=True)
 `
             }
         }, document.getElementById("root"));
