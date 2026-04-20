@@ -252,8 +252,10 @@ with tab_single:
             
             fig1, ax1 = plt.subplots(figsize=(5, 3))
             ax1.plot(np.abs(rx_signal), color='#00aaff', linewidth=1.2)
+            ax1.axvspan(0, CP_LEN - 1, color='#2ca02c', alpha=0.4, label=f'CP ({CP_LEN} pts)')
             ax1.set_title('Time Domain Envelope')
             ax1.grid(True, color=grid_color, alpha=0.5)
+            ax1.legend(loc='upper right', fontsize=8, facecolor=fig_bg_color, edgecolor=grid_color)
             with plot1: st.pyplot(fig1)
 
             fig2, ax2 = plt.subplots(figsize=(5, 3))
