@@ -82,24 +82,21 @@ def calculate_evm_ser(rx_sym, tx_sym, constellation):
     return evm_db, errors / len(tx_sym)
 
 def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd):
-    # --- 1. PA Non-Linearity (Rapp Model) & DPD ---
     rms_sig = np.sqrt(np.mean(np.abs(signal)**2)) + 1e-12
     v_in_rms = 10 ** ((pa_in_dbm - 30) / 20.0)
     scaled_in = signal * (v_in_rms / rms_sig)
     
     v_out_ideal = scaled_in * (10 ** (pa_gain_db / 20.0))
-    p_sat_dbm = pa_p1db_dbm + 1.0 # 假設 Psat 比 P1dB 高 1dB
+    p_sat_dbm = pa_p1db_dbm + 1.0 
     v_sat = 10 ** ((p_sat_dbm - 30) / 20.0)
-    p = 2.0 # Smoothness factor for CMOS/GaAs
+    p = 2.0 
     
-    # ✨ Memoryless DPD (數位預失真) 黑魔法
     if enable_dpd:
         y_mag = np.abs(v_out_ideal)
         y_clip = np.minimum(y_mag, 0.999 * v_sat)
         x_predistort_mag = y_clip / (1.0 - (y_clip / v_sat)**(2*p))**(1.0 / (2*p))
         v_out_ideal = (v_out_ideal / (y_mag + 1e-12)) * x_predistort_mag
 
-    # PA 物理壓縮模型
     v_out_mag = np.abs(v_out_ideal)
     gain_compression = 1.0 / (1.0 + (v_out_mag / v_sat)**(2*p))**(1.0 / (2*p))
     v_out_pa = v_out_ideal * gain_compression
@@ -107,7 +104,6 @@ def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in
     rms_out = np.sqrt(np.mean(np.abs(v_out_pa)**2)) + 1e-12
     signal_pa = v_out_pa * (rms_sig / rms_out)
 
-    # --- 2. IQ Imbalance ---
     g = 10 ** (iq_amp_db / 20.0)
     theta = np.deg2rad(iq_phase_deg)
     I = np.real(signal_pa) * g
@@ -115,7 +111,6 @@ def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in
     Q_skewed = Q * np.cos(theta) - I * np.sin(theta)
     signal_iq = I + 1j * Q_skewed
     
-    # --- 3. Phase Noise ---
     pn_rad = np.deg2rad(phase_noise_deg)
     phase_noise_array = np.random.randn(*signal_iq.shape) * pn_rad
     signal_out = signal_iq * np.exp(1j * phase_noise_array)
@@ -372,17 +367,19 @@ with tab_mlo:
     st.markdown("### Tri-Band Multi-Link Operation (Aggregation Demo)")
     st.markdown("Simulate a WiFi 7 device establishing physical links simultaneously across 2.4GHz, 5GHz, and 6GHz bands, seamlessly aggregating the data layer.")
     
-    # 改為 3 個欄位
     col_link1, col_link2, col_link3 = st.columns(3)
     
     with col_link1:
-        st.markdown("#### 🟢 Link 1 (5 GHz Band)")
+        st.markdown("#### 🟢 Link 1 (5 GHz / 160 MHz)")
         l1_mod = st.selectbox("Link 1 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=1)
         l1_snr = st.slider("Link 1 SNR (dB)", -10, 45, 35, 1, key="l1_snr")
         l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
-        l1_base_mbps = get_mod_bits(l1_mod) * 17.2 
+        
+        # 160 MHz (2x996-tone RU) -> 1992 data subcarriers. Multiplier per bit ≈ 146.47 Mbps
+        l1_base_mbps = get_mod_bits(l1_mod) * 146.47 
         l1_throughput = max(0, l1_base_mbps * ((1 - l1_ser) ** 5))
         st.metric("Link 1 Throughput", f"{l1_throughput:.1f} Mbps", f"EVM: {l1_evm:.1f} dB")
+        
         fig_l1, ax_l1 = plt.subplots(figsize=(4, 3))
         grid_l1 = get_constellation(l1_mod)
         ax_l1.scatter(np.real(grid_l1), np.imag(grid_l1), color='#777777', alpha=0.2, s=5)
@@ -392,13 +389,16 @@ with tab_mlo:
         st.pyplot(fig_l1)
 
     with col_link2:
-        st.markdown("#### 🔵 Link 2 (6 GHz Band)")
+        st.markdown("#### 🔵 Link 2 (6 GHz / 320 MHz)")
         l2_mod = st.selectbox("Link 2 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=0)
         l2_snr = st.slider("Link 2 SNR (dB)", -10, 45, 40, 1, key="l2_snr")
         l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
-        l2_base_mbps = get_mod_bits(l2_mod) * 17.2 
+        
+        # 320 MHz (4x996-tone RU) -> 3984 data subcarriers. Multiplier per bit ≈ 292.94 Mbps
+        l2_base_mbps = get_mod_bits(l2_mod) * 292.94 
         l2_throughput = max(0, l2_base_mbps * ((1 - l2_ser) ** 5))
         st.metric("Link 2 Throughput", f"{l2_throughput:.1f} Mbps", f"EVM: {l2_evm:.1f} dB")
+        
         fig_l2, ax_l2 = plt.subplots(figsize=(4, 3))
         grid_l2 = get_constellation(l2_mod)
         ax_l2.scatter(np.real(grid_l2), np.imag(grid_l2), color='#777777', alpha=0.2, s=5)
@@ -408,36 +408,35 @@ with tab_mlo:
         st.pyplot(fig_l2)
         
     with col_link3:
-        st.markdown("#### 🟠 Link 3 (2.4 GHz Band)")
-        # 預設選用 256-QAM 作為 2.4GHz 的典型高階調變
+        st.markdown("#### 🟠 Link 3 (2.4 GHz / 20 MHz)")
         l3_mod = st.selectbox("Link 3 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=2)
         l3_snr = st.slider("Link 3 SNR (dB)", -10, 45, 30, 1, key="l3_snr")
         l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         
-        # 模擬 2.4GHz 頻寬較窄 (通常為 20MHz/40MHz，所以基礎速度乘數設為 5G/6G 的一半)
-        l3_base_mbps = get_mod_bits(l3_mod) * 8.6 
+        # 2.4GHz 通常維持 20MHz (242-tone RU) 以避開干擾。Multiplier per bit ≈ 17.2 Mbps
+        l3_base_mbps = get_mod_bits(l3_mod) * 17.2 
         l3_throughput = max(0, l3_base_mbps * ((1 - l3_ser) ** 5))
         
         st.metric("Link 3 Throughput", f"{l3_throughput:.1f} Mbps", f"EVM: {l3_evm:.1f} dB")
         fig_l3, ax_l3 = plt.subplots(figsize=(4, 3))
         grid_l3 = get_constellation(l3_mod)
         ax_l3.scatter(np.real(grid_l3), np.imag(grid_l3), color='#777777', alpha=0.2, s=5)
-        # 使用橘色標示 2.4GHz
         ax_l3.scatter(np.real(l3_rx_sym), np.imag(l3_rx_sym), color='#ffaa00', alpha=0.4, s=2)
         ax_l3.axhline(0, color=grid_color); ax_l3.axvline(0, color=grid_color)
         ax_l3.set_title(f'Link 3 Constellation ({l3_mod})')
         st.pyplot(fig_l3)
         
     st.markdown("---")
-    # 將三頻段全部加總
     total_throughput = l1_throughput + l2_throughput + l3_throughput
     st.markdown(f"<h2 style='text-align: center; color: #ff007f;'>🚀 Aggregated Tri-Band MLO Throughput: {total_throughput:.1f} Mbps</h2>", unsafe_allow_html=True)
     
     fig_bar, ax_bar = plt.subplots(figsize=(10, 1.5))
-    ax_bar.barh([0], [l1_throughput], color='#00ffcc', label='Link 1 (5GHz)')
-    ax_bar.barh([0], [l2_throughput], left=[l1_throughput], color='#00aaff', label='Link 2 (6GHz)')
-    ax_bar.barh([0], [l3_throughput], left=[l1_throughput + l2_throughput], color='#ffaa00', label='Link 3 (2.4GHz)')
-    ax_bar.set_xlim([0, 600]) # 拓寬一點 X 軸以容納三段總和
+    ax_bar.barh([0], [l1_throughput], color='#00ffcc', label='Link 1 (5GHz - 160MHz)')
+    ax_bar.barh([0], [l2_throughput], left=[l1_throughput], color='#00aaff', label='Link 2 (6GHz - 320MHz)')
+    ax_bar.barh([0], [l3_throughput], left=[l1_throughput + l2_throughput], color='#ffaa00', label='Link 3 (2.4GHz - 20MHz)')
+    
+    # 拓寬 X 軸以容納高達 5~6 Gbps 的極速
+    ax_bar.set_xlim([0, 6000]) 
     ax_bar.set_yticks([]); ax_bar.set_xlabel("Throughput (Mbps)")
     ax_bar.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
     st.pyplot(fig_bar)
