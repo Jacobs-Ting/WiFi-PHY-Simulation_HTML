@@ -71,7 +71,7 @@ def get_mod_bits(mod_type):
 def calculate_evm_ser(rx_sym, tx_sym, constellation):
     evm_linear = np.sqrt(np.mean(np.abs(rx_sym - tx_sym)**2))
     evm_db = 20 * np.log10(evm_linear + 1e-12)
-    chunk_size = 2000 
+    chunk_size = 200 # 記憶體保護機制
     errors = 0
     for i in range(0, len(rx_sym), chunk_size):
         rx_chunk = rx_sym[i : i + chunk_size]
@@ -81,16 +81,45 @@ def calculate_evm_ser(rx_sym, tx_sym, constellation):
         errors += np.sum(np.abs(tx_chunk - detected_syms) > 1e-5)
     return evm_db, errors / len(tx_sym)
 
-def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg):
+def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd):
+    # --- 1. PA Non-Linearity (Rapp Model) & DPD ---
+    rms_sig = np.sqrt(np.mean(np.abs(signal)**2)) + 1e-12
+    v_in_rms = 10 ** ((pa_in_dbm - 30) / 20.0)
+    scaled_in = signal * (v_in_rms / rms_sig)
+    
+    v_out_ideal = scaled_in * (10 ** (pa_gain_db / 20.0))
+    p_sat_dbm = pa_p1db_dbm + 1.0 # 假設 Psat 比 P1dB 高 1dB
+    v_sat = 10 ** ((p_sat_dbm - 30) / 20.0)
+    p = 2.0 # Smoothness factor for CMOS/GaAs
+    
+    # ✨ Memoryless DPD (數位預失真) 黑魔法
+    if enable_dpd:
+        y_mag = np.abs(v_out_ideal)
+        y_clip = np.minimum(y_mag, 0.999 * v_sat)
+        x_predistort_mag = y_clip / (1.0 - (y_clip / v_sat)**(2*p))**(1.0 / (2*p))
+        v_out_ideal = (v_out_ideal / (y_mag + 1e-12)) * x_predistort_mag
+
+    # PA 物理壓縮模型
+    v_out_mag = np.abs(v_out_ideal)
+    gain_compression = 1.0 / (1.0 + (v_out_mag / v_sat)**(2*p))**(1.0 / (2*p))
+    v_out_pa = v_out_ideal * gain_compression
+    
+    rms_out = np.sqrt(np.mean(np.abs(v_out_pa)**2)) + 1e-12
+    signal_pa = v_out_pa * (rms_sig / rms_out)
+
+    # --- 2. IQ Imbalance ---
     g = 10 ** (iq_amp_db / 20.0)
     theta = np.deg2rad(iq_phase_deg)
-    I = np.real(signal) * g
-    Q = np.imag(signal) / g
+    I = np.real(signal_pa) * g
+    Q = np.imag(signal_pa) / g
     Q_skewed = Q * np.cos(theta) - I * np.sin(theta)
     signal_iq = I + 1j * Q_skewed
+    
+    # --- 3. Phase Noise ---
     pn_rad = np.deg2rad(phase_noise_deg)
     phase_noise_array = np.random.randn(*signal_iq.shape) * pn_rad
     signal_out = signal_iq * np.exp(1j * phase_noise_array)
+    
     return signal_out
 
 def get_ofdm_params(phy_version):
@@ -108,7 +137,7 @@ def get_ofdm_params(phy_version):
     return N_FFT, CP_LEN, data_indices, pilot_indices
 
 @st.cache_data(show_spinner=False)
-def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs):
+def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd):
     N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=len(data_indices))
@@ -117,7 +146,7 @@ def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs):
     ofdm_freq[pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq)) * N_FFT
     tx_signal_clean = np.concatenate([ofdm_time[-CP_LEN:], ofdm_time])
-    tx_impaired = apply_rf_impairments(tx_signal_clean, pn_deg, iq_amp, iq_phs)
+    tx_impaired = apply_rf_impairments(tx_signal_clean, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd)
     papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2) / np.mean(np.abs(tx_impaired)**2))
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
@@ -130,7 +159,7 @@ def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs):
     return tx_signal_clean, rx_signal, tx_symbols, rx_symbols, papr_db, evm, ser
 
 @st.cache_data(show_spinner=False)
-def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, pn_deg, iq_amp, iq_phs):
+def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd):
     N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=(num_syms, len(data_indices)))
@@ -138,7 +167,7 @@ def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, 
     ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
     ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
-    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs)
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd)
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
     noise = np.sqrt(noise_power/2) * (np.random.randn(*tx_impaired.shape) + 1j*np.random.randn(*tx_impaired.shape))
@@ -149,7 +178,7 @@ def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, 
     return rx_symbols_matrix.flatten(), evm, ser
 
 @st.cache_data(show_spinner=False)
-def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs):
+def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd):
     N_FFT, _, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=(num_symbols_for_ccdf, len(data_indices)))
@@ -157,17 +186,17 @@ def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg,
     ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
     ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
-    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs)
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd)
     papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2, axis=1) / np.mean(np.abs(tx_impaired)**2, axis=1))
     return np.sort(papr_db), 1.0 - np.arange(1, num_symbols_for_ccdf + 1) / num_symbols_for_ccdf
 
 @st.cache_data(show_spinner=False)
-def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs):
+def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd):
     num_symbols = 40; barker_11 = np.array([1, -1, 1, 1, -1, 1, 1, 1, -1, -1, -1]); L_c = len(barker_11)
     constellation = np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2) if "2 Mbps" in mod_type else np.array([1, -1])
     tx_symbols = np.random.choice(constellation, size=num_symbols)
     tx_waveform_clean = np.repeat(np.kron(tx_symbols, barker_11), 4)
-    tx_impaired = apply_rf_impairments(tx_waveform_clean, pn_deg, iq_amp, iq_phs)
+    tx_impaired = apply_rf_impairments(tx_waveform_clean, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd)
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
     rx_waveform = tx_impaired + np.sqrt(noise_power/2) * (np.random.randn(len(tx_impaired)) + 1j*np.random.randn(len(tx_impaired)))
@@ -181,7 +210,15 @@ def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs):
 # ==========================================
 st.sidebar.header("📡 Global Settings")
 st.sidebar.markdown("---")
-st.sidebar.header("⚠️ RF Impairments")
+
+st.sidebar.header("🔥 Power Amplifier (PA)")
+pa_in_dbm = st.sidebar.slider("PA Input Power (dBm)", -30.0, 20.0, -10.0, 1.0)
+pa_gain_db = st.sidebar.slider("PA Gain (dB)", 0.0, 30.0, 15.0, 1.0)
+pa_p1db_dbm = st.sidebar.slider("PA Output P1dB (dBm)", 0.0, 40.0, 20.0, 1.0)
+enable_dpd = st.sidebar.checkbox("✨ Enable DPD (Digital Pre-Distortion)", value=False, help="Compensate AM-AM distortion using memoryless inverse Rapp model.")
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚠️ Baseband Impairments")
 pn_deg = st.sidebar.slider("Phase Noise RMS (deg)", 0.0, 5.0, 0.0, step=0.1)
 iq_amp = st.sidebar.slider("IQ Amplitude Imbalance (dB)", 0.0, 3.0, 0.0, step=0.1)
 iq_phs = st.sidebar.slider("IQ Phase Mismatch (deg)", 0.0, 15.0, 0.0, step=0.5)
@@ -236,16 +273,19 @@ with tab_single:
             snr_db = st.slider("Channel SNR (dB)", -10, 45, 40, 1)
 
     with col_plot:
+        pa_out_avg = pa_in_dbm + pa_gain_db
+        is_clipped = pa_out_avg + 5 > pa_p1db_dbm 
+        
         if "OFDM" in phy_mode:
             N_FFT, CP_LEN, data_idx_temp, _ = get_ofdm_params(phy_version)
-            tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs)
-            rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs)
-            sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs)
+            tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+            rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+            sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("OFDM PAPR", f"{papr_db_snapshot:.2f} dB")
+            c1.metric("Avg PA Output Power", f"{pa_out_avg:.1f} dBm", "- Compression Alert" if is_clipped else "+ Linear Region", delta_color="inverse" if is_clipped else "normal")
             c2.metric("PAPR @ 0.1%", f"{sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]:.2f} dB")
-            c3.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
+            c3.metric("EVM (RMS)", f"{evm_acc:.2f} dB")
             c4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
             
             plot1, plot2 = st.columns(2); plot3, plot4 = st.columns(2)
@@ -282,18 +322,21 @@ with tab_single:
             ax4.semilogy(sorted_papr_db, ccdf_y, color='#00ff00', linewidth=2)
             ax4.axhline(1e-2, color='#aaaaaa', linestyle='--'); ax4.axhline(1e-3, color='#aaaaaa', linestyle='-.', alpha=0.5)
             ax4.set_title('PAPR CCDF')
+            ax4.set_xlabel('PAPR (dB)', fontsize=9)
+            ax4.set_ylabel('Probability', fontsize=9)
+            ax4.set_xlim([1, 15])
             ax4.set_ylim([1/num_symbols_for_ccdf, 1.2])
             ax4.grid(True, which="both", axis="both", color=grid_color, alpha=0.5)
             with plot4: st.pyplot(fig4)
             
         else:
-            rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs)
+            rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Processing Gain", "10.41 dB")
-            c2.metric("EVM (RMS)", f"{evm_acc:.2f} dB", delta="Impaired" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "Ideal", delta_color="inverse" if (pn_deg>0 or iq_amp>0 or iq_phs>0) else "normal")
-            c3.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
-            c4.write("")
+            c1.metric("Avg PA Output Power", f"{pa_out_avg:.1f} dBm", "- Compression Alert" if is_clipped else "+ Linear Region", delta_color="inverse" if is_clipped else "normal")
+            c2.metric("Processing Gain", "10.41 dB")
+            c3.metric("EVM (RMS)", f"{evm_acc:.2f} dB")
+            c4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
             
             plot1, plot2 = st.columns(2); plot3, plot4 = st.columns(2)
             
@@ -323,17 +366,20 @@ with tab_single:
             with plot3: st.pyplot(fig3)
 
 # ---------------------------------------------------------
-# Tab 2: WiFi 7 MLO (Bandwidth Aggregation Demo)
+# Tab 2: WiFi 7 Tri-Band MLO (Bandwidth Aggregation Demo)
 # ---------------------------------------------------------
 with tab_mlo:
-    st.markdown("### Multi-Link Operation (Bandwidth Aggregation Demo)")
-    st.markdown("Simulate a WiFi 7 device establishing physical links simultaneously in 5GHz and 6GHz bands, seamlessly aggregating the data layer.")
-    col_link1, col_link2 = st.columns(2)
+    st.markdown("### Tri-Band Multi-Link Operation (Aggregation Demo)")
+    st.markdown("Simulate a WiFi 7 device establishing physical links simultaneously across 2.4GHz, 5GHz, and 6GHz bands, seamlessly aggregating the data layer.")
+    
+    # 改為 3 個欄位
+    col_link1, col_link2, col_link3 = st.columns(3)
+    
     with col_link1:
         st.markdown("#### 🟢 Link 1 (5 GHz Band)")
         l1_mod = st.selectbox("Link 1 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=1)
         l1_snr = st.slider("Link 1 SNR (dB)", -10, 45, 35, 1, key="l1_snr")
-        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, 20, pn_deg, iq_amp, iq_phs)
+        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         l1_base_mbps = get_mod_bits(l1_mod) * 17.2 
         l1_throughput = max(0, l1_base_mbps * ((1 - l1_ser) ** 5))
         st.metric("Link 1 Throughput", f"{l1_throughput:.1f} Mbps", f"EVM: {l1_evm:.1f} dB")
@@ -349,7 +395,7 @@ with tab_mlo:
         st.markdown("#### 🔵 Link 2 (6 GHz Band)")
         l2_mod = st.selectbox("Link 2 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=0)
         l2_snr = st.slider("Link 2 SNR (dB)", -10, 45, 40, 1, key="l2_snr")
-        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, 20, pn_deg, iq_amp, iq_phs)
+        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         l2_base_mbps = get_mod_bits(l2_mod) * 17.2 
         l2_throughput = max(0, l2_base_mbps * ((1 - l2_ser) ** 5))
         st.metric("Link 2 Throughput", f"{l2_throughput:.1f} Mbps", f"EVM: {l2_evm:.1f} dB")
@@ -361,13 +407,37 @@ with tab_mlo:
         ax_l2.set_title(f'Link 2 Constellation ({l2_mod})')
         st.pyplot(fig_l2)
         
+    with col_link3:
+        st.markdown("#### 🟠 Link 3 (2.4 GHz Band)")
+        # 預設選用 256-QAM 作為 2.4GHz 的典型高階調變
+        l3_mod = st.selectbox("Link 3 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=2)
+        l3_snr = st.slider("Link 3 SNR (dB)", -10, 45, 30, 1, key="l3_snr")
+        l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+        
+        # 模擬 2.4GHz 頻寬較窄 (通常為 20MHz/40MHz，所以基礎速度乘數設為 5G/6G 的一半)
+        l3_base_mbps = get_mod_bits(l3_mod) * 8.6 
+        l3_throughput = max(0, l3_base_mbps * ((1 - l3_ser) ** 5))
+        
+        st.metric("Link 3 Throughput", f"{l3_throughput:.1f} Mbps", f"EVM: {l3_evm:.1f} dB")
+        fig_l3, ax_l3 = plt.subplots(figsize=(4, 3))
+        grid_l3 = get_constellation(l3_mod)
+        ax_l3.scatter(np.real(grid_l3), np.imag(grid_l3), color='#777777', alpha=0.2, s=5)
+        # 使用橘色標示 2.4GHz
+        ax_l3.scatter(np.real(l3_rx_sym), np.imag(l3_rx_sym), color='#ffaa00', alpha=0.4, s=2)
+        ax_l3.axhline(0, color=grid_color); ax_l3.axvline(0, color=grid_color)
+        ax_l3.set_title(f'Link 3 Constellation ({l3_mod})')
+        st.pyplot(fig_l3)
+        
     st.markdown("---")
-    total_throughput = l1_throughput + l2_throughput
-    st.markdown(f"<h2 style='text-align: center; color: #ff007f;'>🚀 Aggregated MLO Throughput: {total_throughput:.1f} Mbps</h2>", unsafe_allow_html=True)
+    # 將三頻段全部加總
+    total_throughput = l1_throughput + l2_throughput + l3_throughput
+    st.markdown(f"<h2 style='text-align: center; color: #ff007f;'>🚀 Aggregated Tri-Band MLO Throughput: {total_throughput:.1f} Mbps</h2>", unsafe_allow_html=True)
+    
     fig_bar, ax_bar = plt.subplots(figsize=(10, 1.5))
     ax_bar.barh([0], [l1_throughput], color='#00ffcc', label='Link 1 (5GHz)')
     ax_bar.barh([0], [l2_throughput], left=[l1_throughput], color='#00aaff', label='Link 2 (6GHz)')
-    ax_bar.set_xlim([0, 500]) 
+    ax_bar.barh([0], [l3_throughput], left=[l1_throughput + l2_throughput], color='#ffaa00', label='Link 3 (2.4GHz)')
+    ax_bar.set_xlim([0, 600]) # 拓寬一點 X 軸以容納三段總和
     ax_bar.set_yticks([]); ax_bar.set_xlabel("Throughput (Mbps)")
     ax_bar.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
     st.pyplot(fig_bar)
