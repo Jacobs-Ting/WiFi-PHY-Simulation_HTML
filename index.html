@@ -68,10 +68,20 @@ def get_mod_bits(mod_type):
     mapping = {"BPSK": 1, "QPSK": 2, "16-QAM": 4, "64-QAM": 6, "256-QAM": 8, "1024-QAM": 10, "4096-QAM": 12}
     return mapping.get(mod_type, 2)
 
+def get_bw_multiplier(bw):
+    mapping = {20: 17.2, 40: 36.0, 80: 75.0, 160: 146.5, 320: 293.0}
+    return mapping.get(bw, 17.2)
+
+def get_plot_params(mod_type):
+    if "4096" in mod_type: return 100, 0.5, 0.5   
+    if "1024" in mod_type: return 60, 1.0, 1.0    
+    if "256" in mod_type: return 30, 2.0, 2.0     
+    return 20, 4.0, 4.0                           
+
 def calculate_evm_ser(rx_sym, tx_sym, constellation):
     evm_linear = np.sqrt(np.mean(np.abs(rx_sym - tx_sym)**2))
     evm_db = 20 * np.log10(evm_linear + 1e-12)
-    chunk_size = 200 # 記憶體保護機制
+    chunk_size = 200 
     errors = 0
     for i in range(0, len(rx_sym), chunk_size):
         rx_chunk = rx_sym[i : i + chunk_size]
@@ -228,11 +238,14 @@ if st.sidebar.button("🚀 Clear Cache & Rerun", use_container_width=True):
 st.title(f"WiFi PHY & MAC Simulator")
 
 # Tabs Creation
-tab_single, tab_mlo, tab_waterfall, tab_hw = st.tabs([
-    "📡 Single-Link PHY", 
-    "🚀 WiFi 7 MLO (Aggregation)", 
-    "🌊 Time-Frequency Waterfall",
-    "⚙️ Hardware Arch (STR/NSTR)"
+tab_single, tab_mlo, tab_waterfall, tab_hw, tab_budget, tab_mimo, tab_ofdma = st.tabs([
+    "📡 Single PHY", 
+    "🚀 MLO", 
+    "🌊 Waterfall",
+    "⚙️ STR/NSTR",
+    "📡 Link Budget",
+    "🔮 MU-MIMO",
+    "🧩 OFDMA & RU"
 ])
 
 # Global Plot Styling
@@ -305,9 +318,10 @@ with tab_single:
 
             fig3, ax3 = plt.subplots(figsize=(5, 3))
             full_grid = get_constellation(mod_type) 
-            ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=15)
-            pt_size = 2 if phy_version == "HE" else 8
-            ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.3, s=pt_size)
+            _, _, s_grid_t1 = get_plot_params(mod_type)
+            s_pt_t1 = s_grid_t1 * 2 
+            ax3.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=s_grid_t1*3)
+            ax3.scatter(np.real(rx_sym_accumulated), np.imag(rx_sym_accumulated), color='#00ffcc', alpha=0.3, s=s_pt_t1)
             ax3.axhline(0, color=grid_color); ax3.axvline(0, color=grid_color)
             ax3.set_title('Rx Constellation Diagram')
             ax3.grid(True, color=grid_color, alpha=0.5)
@@ -373,17 +387,17 @@ with tab_mlo:
         st.markdown("#### 🟢 Link 1 (5 GHz / 160 MHz)")
         l1_mod = st.selectbox("Link 1 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=1)
         l1_snr = st.slider("Link 1 SNR (dB)", -10, 45, 35, 1, key="l1_snr")
-        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+        l1_syms, l1_pt_s, l1_grid_s = get_plot_params(l1_mod)
+        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, l1_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         
-        # 160 MHz (2x996-tone RU) -> 1992 data subcarriers. Multiplier per bit ≈ 146.47 Mbps
         l1_base_mbps = get_mod_bits(l1_mod) * 146.47 
         l1_throughput = max(0, l1_base_mbps * ((1 - l1_ser) ** 5))
         st.metric("Link 1 Throughput", f"{l1_throughput:.1f} Mbps", f"EVM: {l1_evm:.1f} dB")
         
         fig_l1, ax_l1 = plt.subplots(figsize=(4, 3))
         grid_l1 = get_constellation(l1_mod)
-        ax_l1.scatter(np.real(grid_l1), np.imag(grid_l1), color='#777777', alpha=0.2, s=5)
-        ax_l1.scatter(np.real(l1_rx_sym), np.imag(l1_rx_sym), color='#00ffcc', alpha=0.4, s=2)
+        ax_l1.scatter(np.real(grid_l1), np.imag(grid_l1), color='#777777', alpha=0.3, s=l1_grid_s)
+        ax_l1.scatter(np.real(l1_rx_sym), np.imag(l1_rx_sym), color='#00ffcc', alpha=0.6, s=l1_pt_s)
         ax_l1.axhline(0, color=grid_color); ax_l1.axvline(0, color=grid_color)
         ax_l1.set_title(f'Link 1 Constellation ({l1_mod})')
         st.pyplot(fig_l1)
@@ -392,17 +406,17 @@ with tab_mlo:
         st.markdown("#### 🔵 Link 2 (6 GHz / 320 MHz)")
         l2_mod = st.selectbox("Link 2 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=0)
         l2_snr = st.slider("Link 2 SNR (dB)", -10, 45, 40, 1, key="l2_snr")
-        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+        l2_syms, l2_pt_s, l2_grid_s = get_plot_params(l2_mod)
+        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, l2_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         
-        # 320 MHz (4x996-tone RU) -> 3984 data subcarriers. Multiplier per bit ≈ 292.94 Mbps
         l2_base_mbps = get_mod_bits(l2_mod) * 292.94 
         l2_throughput = max(0, l2_base_mbps * ((1 - l2_ser) ** 5))
         st.metric("Link 2 Throughput", f"{l2_throughput:.1f} Mbps", f"EVM: {l2_evm:.1f} dB")
         
         fig_l2, ax_l2 = plt.subplots(figsize=(4, 3))
         grid_l2 = get_constellation(l2_mod)
-        ax_l2.scatter(np.real(grid_l2), np.imag(grid_l2), color='#777777', alpha=0.2, s=5)
-        ax_l2.scatter(np.real(l2_rx_sym), np.imag(l2_rx_sym), color='#00aaff', alpha=0.4, s=2)
+        ax_l2.scatter(np.real(grid_l2), np.imag(grid_l2), color='#777777', alpha=0.3, s=l2_grid_s)
+        ax_l2.scatter(np.real(l2_rx_sym), np.imag(l2_rx_sym), color='#00aaff', alpha=0.6, s=l2_pt_s)
         ax_l2.axhline(0, color=grid_color); ax_l2.axvline(0, color=grid_color)
         ax_l2.set_title(f'Link 2 Constellation ({l2_mod})')
         st.pyplot(fig_l2)
@@ -411,17 +425,17 @@ with tab_mlo:
         st.markdown("#### 🟠 Link 3 (2.4 GHz / 20 MHz)")
         l3_mod = st.selectbox("Link 3 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=2)
         l3_snr = st.slider("Link 3 SNR (dB)", -10, 45, 30, 1, key="l3_snr")
-        l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, 20, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
+        l3_syms, l3_pt_s, l3_grid_s = get_plot_params(l3_mod)
+        l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, l3_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd)
         
-        # 2.4GHz 通常維持 20MHz (242-tone RU) 以避開干擾。Multiplier per bit ≈ 17.2 Mbps
         l3_base_mbps = get_mod_bits(l3_mod) * 17.2 
         l3_throughput = max(0, l3_base_mbps * ((1 - l3_ser) ** 5))
         
         st.metric("Link 3 Throughput", f"{l3_throughput:.1f} Mbps", f"EVM: {l3_evm:.1f} dB")
         fig_l3, ax_l3 = plt.subplots(figsize=(4, 3))
         grid_l3 = get_constellation(l3_mod)
-        ax_l3.scatter(np.real(grid_l3), np.imag(grid_l3), color='#777777', alpha=0.2, s=5)
-        ax_l3.scatter(np.real(l3_rx_sym), np.imag(l3_rx_sym), color='#ffaa00', alpha=0.4, s=2)
+        ax_l3.scatter(np.real(grid_l3), np.imag(grid_l3), color='#777777', alpha=0.3, s=l3_grid_s)
+        ax_l3.scatter(np.real(l3_rx_sym), np.imag(l3_rx_sym), color='#ffaa00', alpha=0.6, s=l3_pt_s)
         ax_l3.axhline(0, color=grid_color); ax_l3.axvline(0, color=grid_color)
         ax_l3.set_title(f'Link 3 Constellation ({l3_mod})')
         st.pyplot(fig_l3)
@@ -435,7 +449,6 @@ with tab_mlo:
     ax_bar.barh([0], [l2_throughput], left=[l1_throughput], color='#00aaff', label='Link 2 (6GHz - 320MHz)')
     ax_bar.barh([0], [l3_throughput], left=[l1_throughput + l2_throughput], color='#ffaa00', label='Link 3 (2.4GHz - 20MHz)')
     
-    # 拓寬 X 軸以容納高達 5~6 Gbps 的極速
     ax_bar.set_xlim([0, 6000]) 
     ax_bar.set_yticks([]); ax_bar.set_xlabel("Throughput (Mbps)")
     ax_bar.legend(loc='upper right', facecolor=fig_bg_color, edgecolor=grid_color)
@@ -647,6 +660,441 @@ with tab_hw:
             ax_hw.text(8.2, 3.25, 'Leakage', color='#ff0000', ha='right', va='center', fontweight='bold', fontsize=13)
 
     st.pyplot(fig_hw, use_container_width=True)
+
+# ---------------------------------------------------------
+# Tab 5: Link Budget & Range Predictor
+# ---------------------------------------------------------
+with tab_budget:
+    st.markdown("### Advanced Link Budget & Range Predictor (with Beamforming)")
+    st.markdown("Calculate the real-world coverage distance for high-order modulations (e.g., 4096-QAM). Account for Thermal Noise Floor increases with wider bandwidths and range extensions via **Tx Beamforming Array Gain**.")
+    
+    col_b1, col_b2 = st.columns([1, 2.5])
+    
+    with col_b1:
+        st.subheader("Link Parameters")
+        freq_ghz = st.selectbox("Frequency Band", [2.4, 5.0, 6.0], index=2, format_func=lambda x: f"{x} GHz")
+        bw_mhz = st.selectbox("Channel Bandwidth", [20, 40, 80, 160, 320], index=4, format_func=lambda x: f"{x} MHz")
+        lb_tx_power = st.slider("Base Tx Power (dBm)", 0.0, 30.0, 20.0, 0.5, help="Transmitter output power before array gain")
+        lb_num_ant = st.slider("Tx Antennas (Beamforming)", 1, 16, 4, 1, help="Number of transmitting antennas. Array Gain = 10 * log10(N)")
+        lb_ant_gain = st.slider("Antenna Element Gain (dBi)", 0.0, 15.0, 5.0, 0.5, help="Physical gain of a single antenna element")
+        lb_nf = st.slider("Receiver Noise Figure (dB)", 2.0, 10.0, 5.0, 0.5, help="LNA noise figure at receiver")
+        
+    with col_b2:
+        noise_floor = -174.0 + 10 * np.log10(bw_mhz * 1e6) + lb_nf
+        distances = np.logspace(0, 3, 200) 
+        fspl = 20 * np.log10(distances) + 20 * np.log10(freq_ghz * 1000) - 27.55
+        bf_gain_db = 10 * np.log10(lb_num_ant)
+        
+        rx_power_bf = lb_tx_power + lb_ant_gain + bf_gain_db - fspl
+        snr_curve_bf = rx_power_bf - noise_floor
+        
+        rx_power_no_bf = lb_tx_power + lb_ant_gain - fspl
+        snr_curve_no_bf = rx_power_no_bf - noise_floor
+        
+        snr_target_mcs13 = 40.0 
+        snr_target_mcs0 = 2.0   
+        
+        idx_mcs13 = np.where(snr_curve_bf >= snr_target_mcs13)[0]
+        dist_mcs13 = distances[idx_mcs13[-1]] if len(idx_mcs13) > 0 else 0
+        
+        idx_mcs0 = np.where(snr_curve_bf >= snr_target_mcs0)[0]
+        dist_mcs0 = distances[idx_mcs0[-1]] if len(idx_mcs0) > 0 else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Thermal Noise Floor", f"{noise_floor:.1f} dBm")
+        c2.metric("Beamforming Gain", f"+{bf_gain_db:.1f} dB", f"{lb_num_ant} Antennas")
+        c3.metric("Max Range (MCS 13)", f"{dist_mcs13:.1f} m", "4096-QAM")
+        c4.metric("Max Range (MCS 0)", f"{dist_mcs0:.1f} m", "BPSK")
+
+        fig_lb, ax_lb = plt.subplots(figsize=(10, 4.5))
+        if lb_num_ant > 1:
+            ax_lb.plot(distances, snr_curve_no_bf, color="#555555", lw=1.5, linestyle="--", label="SNR (No Beamforming)")
+            
+        ax_lb.plot(distances, snr_curve_bf, label="Received SNR (with Beamforming)", color="#00aaff", lw=2.5)
+        
+        ax_lb.axhline(snr_target_mcs13, color="#00ffcc", linestyle="--", lw=2)
+        ax_lb.text(2, snr_target_mcs13 + 1, "MCS 13 Threshold (4096-QAM)", color="#00ffcc", fontsize=10)
+        if dist_mcs13 > 0:
+            ax_lb.plot(dist_mcs13, snr_target_mcs13, 'o', color='#00ffcc', markersize=8)
+            ax_lb.vlines(dist_mcs13, 0, snr_target_mcs13, colors='#00ffcc', linestyles='dotted')
+        
+        ax_lb.axhline(snr_target_mcs0, color="#ffaa00", linestyle="--", lw=2)
+        ax_lb.text(2, snr_target_mcs0 + 1, "MCS 0 Threshold (BPSK)", color="#ffaa00", fontsize=10)
+        if dist_mcs0 > 0:
+            ax_lb.plot(dist_mcs0, snr_target_mcs0, 'o', color='#ffaa00', markersize=8)
+            ax_lb.vlines(dist_mcs0, 0, snr_target_mcs0, colors='#ffaa00', linestyles='dotted')
+
+        ax_lb.set_xscale('log')
+        ax_lb.set_xlim([1, 1000])
+        ax_lb.set_ylim([0, 80])
+        ax_lb.set_xlabel("Distance (meters) - Log Scale", fontsize=11)
+        ax_lb.set_ylabel("Signal-to-Noise Ratio (dB)", fontsize=11)
+        ax_lb.set_title("Link Budget: SNR Attenuation over Distance (Free Space Path Loss)", fontsize=13)
+        ax_lb.grid(True, which="both", ls="-", color=grid_color, alpha=0.3)
+        ax_lb.legend(loc="upper right", facecolor=fig_bg_color, edgecolor=grid_color)
+        
+        st.pyplot(fig_lb, use_container_width=True)
+
+# ---------------------------------------------------------
+# Tab 6: MU-MIMO (Spatial Multiplexing & ZF Precoding)
+# ---------------------------------------------------------
+with tab_mimo:
+    st.markdown("### MU-MIMO & Spatial Multiplexing (Zero-Forcing Precoding)")
+    st.markdown("Explore how APs use spatial dimensions to serve multiple users simultaneously. Watch how **Angular Separation** impacts the AP's ability to create deep **Nulls** via Zero-Forcing to eliminate Inter-User Interference (IUI).")
+
+    col_m1, col_m2 = st.columns([1, 2.8])
+    
+    with col_m1:
+        st.subheader("Spatial Parameters")
+        mu_ntx = st.selectbox("AP Tx Antennas (N)", [2, 4, 8, 16], index=2, help="Number of antennas at the AP.")
+        
+        max_users = min(4, mu_ntx)
+        mu_k = st.slider("Active Users (STAs)", 1, max_users, 2 if max_users >= 2 else 1)
+        
+        st.markdown("---")
+        mu_sep = st.slider("User Angular Separation (deg) ⚠️", 2, 90, 30, help="If users are too close, spatial correlation increases, nulls fail, and MU-MIMO capacity crashes.")
+        
+        mu_bw = st.selectbox("Channel Bandwidth ", [20, 40, 80, 160, 320], index=3, format_func=lambda x: f"{x} MHz")
+        mu_mod = st.selectbox("MU-MIMO Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK"], index=1)
+        mu_snr = st.slider("Base Channel SNR (dB)", 10, 50, 40)
+
+    with col_m2:
+        N = int(mu_ntx)
+        K = int(mu_k)
+        
+        angles_deg = np.linspace(-(K-1)*mu_sep/2.0, (K-1)*mu_sep/2.0, K) if K > 1 else np.array([0.0])
+        
+        H = np.exp(1j * np.pi * np.outer(np.sin(np.radians(angles_deg)), np.arange(N)))
+        W_zf = H.conj().T @ np.linalg.inv(H @ H.conj().T + 1e-5 * np.eye(K))
+        
+        # 修正: 轉換為純實數
+        norm_factor = np.sqrt(K / np.trace(W_zf @ W_zf.conj().T)).real
+        penalty_db = 20 * np.log10(norm_factor)
+        
+        W_tx = W_zf * norm_factor
+        Heff = H @ W_tx
+        
+        constellation = get_constellation(mu_mod)
+        num_syms = 2000
+        tx_symbols = np.random.choice(constellation, size=(K, num_syms))
+        
+        noise_power = 10**(-mu_snr / 10.0)
+        noise = np.sqrt(noise_power/2) * (np.random.randn(K, num_syms) + 1j * np.random.randn(K, num_syms))
+        
+        rx_symbols = Heff @ tx_symbols + noise
+        rx_sta1_raw = rx_symbols[0, :] 
+        
+        # 修正: 實作 Receiver AGC 確保星座圖與 EVM 不受純量放大影響
+        pwr_tx = np.mean(np.abs(tx_symbols[0,:])**2)
+        pwr_rx = np.mean(np.abs(rx_sta1_raw)**2) + 1e-12
+        rx_sta1_agc = rx_sta1_raw * np.sqrt(pwr_tx / pwr_rx)
+        
+        evm_db, ser_sta1 = calculate_evm_ser(rx_sta1_agc, tx_symbols[0,:], constellation)
+        
+        # 修正: 轉換為真實 Data Rate (Mbps)
+        base_mbps_per_stream = get_mod_bits(mu_mod) * get_bw_multiplier(mu_bw)
+        su_throughput = base_mbps_per_stream
+        mu_throughput = K * base_mbps_per_stream * (max(0, 1 - ser_sta1) ** 5)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("STA 1 Received EVM", f"{evm_db:.1f} dB", "- IUI Degraded" if evm_db > -30 else "Clear Signal", delta_color="inverse" if evm_db > -30 else "normal")
+        c2.metric("MU-MIMO Total Throughput", f"{mu_throughput:.1f} Mbps", f"vs SU-MIMO: {su_throughput:.1f} Mbps", delta_color="normal" if mu_throughput >= su_throughput else "inverse")
+        c3.metric("Precoding Power Penalty", f"{penalty_db:.1f} dB", "Power wasted to create nulls" if penalty_db < -3.0 else "Efficient", delta_color="inverse" if penalty_db < -3.0 else "normal")
+
+        plot_p, plot_c = st.columns(2)
+        
+        theta_range = np.linspace(-90, 90, 360)
+        A_theta = np.exp(1j * np.pi * np.outer(np.sin(np.radians(theta_range)), np.arange(N)))
+        pattern_sta1 = np.abs(A_theta @ W_tx[:, 0])**2
+        pattern_db = 10 * np.log10(pattern_sta1 + 1e-10)
+        pattern_db = np.maximum(pattern_db, -40) 
+
+        fig_pol, ax_pol = plt.subplots(figsize=(5, 4), subplot_kw={'projection': 'polar'})
+        ax_pol.set_facecolor(fig_bg_color)
+        ax_pol.set_theta_zero_location("N")
+        ax_pol.set_theta_direction(-1)
+        ax_pol.set_thetamin(-90)
+        ax_pol.set_thetamax(90)
+        ax_pol.plot(np.radians(theta_range), pattern_db, color='#00ffcc', lw=2)
+        
+        for k in range(K):
+            color = '#00ffcc' if k == 0 else '#ff007f'
+            label = f'STA {k+1}' if k == 0 else (f'Interferer (STA {k+1})' if k==1 else None)
+            ax_pol.plot([np.radians(angles_deg[k]), np.radians(angles_deg[k])], [-40, np.max(pattern_db)], color=color, linestyle='--', lw=2, label=label)
+            
+        ax_pol.set_title("AP Radiation Pattern (Beam targeted at STA 1)", color='white', pad=15)
+        ax_pol.grid(color=grid_color, alpha=0.5)
+        ax_pol.set_rticks([-30, -20, -10, 0])
+        ax_pol.set_yticklabels([])
+        ax_pol.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), facecolor=fig_bg_color, edgecolor=grid_color, fontsize=8)
+        with plot_p: st.pyplot(fig_pol)
+
+        fig_const, ax_const = plt.subplots(figsize=(5, 4))
+        full_grid = get_constellation(mu_mod)
+        _, _, s_grid = get_plot_params(mu_mod)
+        ax_const.scatter(np.real(full_grid), np.imag(full_grid), color='#777777', alpha=0.3, s=s_grid*3)
+        ax_const.scatter(np.real(rx_sta1_agc), np.imag(rx_sta1_agc), color='#00ffcc', alpha=0.4, s=s_grid*2)
+        ax_const.axhline(0, color=grid_color); ax_const.axvline(0, color=grid_color)
+        ax_const.set_title(f'STA 1 Constellation Diagram')
+        ax_const.grid(True, color=grid_color, alpha=0.5)
+        with plot_c: st.pyplot(fig_const)
+        
+        st.markdown("---")
+        fig_cap, ax_cap = plt.subplots(figsize=(10, 1.5))
+        ax_cap.barh([1], [su_throughput], color='#555555', label='SU-MIMO (Time-Division)')
+        ax_cap.barh([0], [mu_throughput], color='#00aaff', label='MU-MIMO (Spatial-Multiplexing)')
+        ax_cap.set_yticks([0, 1])
+        ax_cap.set_yticklabels(['MU-MIMO', 'SU-MIMO (Base)'], color=text_color)
+        ax_cap.set_xlim([0, max(su_throughput, mu_throughput) * 1.2 + 1])
+        ax_cap.set_xlabel("Total System Throughput (Mbps)", color=text_color)
+        ax_cap.legend(loc='lower right', facecolor=fig_bg_color, edgecolor=grid_color)
+        
+        if mu_throughput < su_throughput:
+            ax_cap.text(mu_throughput + 10, 0, "⚠️ IUI Collapse!", color="#ff0000", va='center', fontweight='bold')
+            
+        st.pyplot(fig_cap)
+
+# ---------------------------------------------------------
+# Tab 7: OFDMA & RU Allocation (Frequency Slicing)
+# ---------------------------------------------------------
+with tab_ofdma:
+    st.markdown("### OFDMA & Resource Unit (RU) Allocation")
+    st.markdown("Observe how **OFDMA (WiFi 6/7)** slices the frequency spectrum into Resource Units (RUs) to serve multiple users simultaneously, eliminating the 'padding waste' and high queuing latency of **Legacy OFDM (WiFi 4/5)**.")
+    
+    # ==========================================
+    # Part 1: Macro View (Time-Frequency Tetris)
+    # ==========================================
+    st.markdown("#### 1. Macro View: Packet Scheduling & Puncturing")
+    col_o1, col_o2 = st.columns([1, 2.8])
+    
+    with col_o1:
+        ofdma_bw = st.selectbox("Channel Bandwidth (MHz)", [20, 40, 80, 160], index=3)
+        traffic_profile = st.selectbox("Traffic Profile", ["1 Heavy User (e.g., 4K Streaming)", "Mixed (1 Heavy + 3 IoT Devices)", "Dense (9 VoIP Callers)"], index=1)
+        mac_mode = st.radio("MAC Operation Mode", ["Legacy OFDM (Time-Division)", "OFDMA (Frequency-Slicing)"])
+        
+        st.markdown("---")
+        puncturing = st.checkbox("⚠️ Trigger 20MHz Interference", value=False, help="Simulate a narrow 20MHz interference blocking the middle of the channel.")
+        
+    with col_o2:
+        max_width = ofdma_bw
+        
+        if "Heavy" in traffic_profile and "Mixed" not in traffic_profile:
+            users = [{"id": 1, "type": "Heavy", "color": "#00aaff", "units": 100}]
+        elif "Mixed" in traffic_profile:
+            users = [
+                {"id": 1, "type": "Heavy", "color": "#00aaff", "units": 80},
+                {"id": 2, "type": "IoT", "color": "#ff007f", "units": 10},
+                {"id": 3, "type": "IoT", "color": "#ffaa00", "units": 10},
+                {"id": 4, "type": "IoT", "color": "#00ffcc", "units": 10}
+            ]
+        else: 
+            users = [{"id": i, "type": "VoIP", "color": plt.cm.get_cmap('Set3')(i/9), "units": 5} for i in range(1, 10)]
+
+        boxes = []
+        current_y = 0
+        total_used_area = 0
+        
+        effective_bw = max_width
+        puncture_start, puncture_end = 0, 0
+        if puncturing:
+            if max_width >= 80:
+                puncture_start = max_width/2 - 20
+                puncture_end = max_width/2
+                if "Legacy" in mac_mode:
+                    effective_bw = puncture_start
+                else:
+                    effective_bw = max_width - 20
+            else:
+                effective_bw = max_width / 2
+
+        if "Legacy" in mac_mode:
+            for u in users:
+                duration = max(10, u["units"] * 100 / effective_bw) 
+                boxes.append({"x": 0, "y": current_y, "w": effective_bw, "h": duration, "c": u["color"], "label": f"{u['type']} {u['id']}"})
+                total_used_area += (u["units"] * 100 / effective_bw) * effective_bw 
+                current_y += duration
+            total_time = current_y
+            efficiency = (total_used_area / (effective_bw * total_time)) * 100 if total_time > 0 else 0
+            latency = total_time * 0.1 
+            
+        else:
+            x_offset = 0
+            max_h_in_row = 0
+            for u in users:
+                if len(users) == 1:
+                    w = effective_bw
+                elif u["type"] == "Heavy":
+                    w = effective_bw * 0.6
+                else:
+                    w = effective_bw * (0.4 / (len(users) - 1))
+                
+                duration = u["units"] * 100 / w
+                
+                if puncturing and max_width >= 80 and "Legacy" not in mac_mode:
+                    if x_offset == puncture_start:
+                        x_offset = puncture_end
+                        
+                    if x_offset < puncture_start and (x_offset + w) > puncture_start:
+                        w1 = puncture_start - x_offset 
+                        w2 = w - w1                    
+                        boxes.append({"x": x_offset, "y": 0, "w": w1, "h": duration, "c": u["color"], "label": f"{u['type']} {u['id']}"})
+                        boxes.append({"x": puncture_end, "y": 0, "w": w2, "h": duration, "c": u["color"], "label": ""})
+                        x_offset = puncture_end + w2
+                    else:
+                        boxes.append({"x": x_offset, "y": 0, "w": w, "h": duration, "c": u["color"], "label": f"{u['type']} {u['id']}"})
+                        x_offset += w
+                else:
+                    boxes.append({"x": x_offset, "y": 0, "w": w, "h": duration, "c": u["color"], "label": f"{u['type']} {u['id']}"})
+                    x_offset += w
+                    
+                total_used_area += w * duration
+                if duration > max_h_in_row: max_h_in_row = duration
+                
+            total_time = max_h_in_row
+            efficiency = (total_used_area / (effective_bw * total_time)) * 100 if total_time > 0 else 0
+            latency = total_time * 0.1 
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Airtime Efficiency", f"{efficiency:.1f} %", "Padding Waste" if efficiency < 50 else "Optimized", delta_color="inverse" if efficiency < 50 else "normal")
+        c2.metric("Queueing Latency", f"{latency:.1f} ms", "Sequential Delay" if "Legacy" in mac_mode and len(users)>1 else "Parallel Delivery", delta_color="inverse" if "Legacy" in mac_mode and len(users)>1 else "normal")
+        c3.metric("Effective Bandwidth", f"{effective_bw:.0f} MHz", f"-{max_width - effective_bw:.0f} MHz Loss" if effective_bw < max_width else "Full BW", delta_color="inverse" if effective_bw < max_width else "normal")
+
+        fig_tetris, ax_tetris = plt.subplots(figsize=(10, 3.0))
+        ax_tetris.set_xlim([0, max_width])
+        ax_tetris.set_ylim([0, max(50, total_time + 10)])
+        
+        if puncturing and max_width >= 80:
+            rect_interfere = patches.Rectangle((puncture_start, 0), 20, max(50, total_time + 10), linewidth=0, facecolor='#ff0000', alpha=0.3, hatch='//')
+            ax_tetris.add_patch(rect_interfere)
+            ax_tetris.text(puncture_start + 10, max(50, total_time + 10)/2, "Interference\\n(Punctured)", color='white', ha='center', va='center', rotation=90, alpha=0.7)
+            
+            if "Legacy" in mac_mode:
+                rect_lost = patches.Rectangle((puncture_start, 0), max_width - puncture_start, max(50, total_time + 10), linewidth=0, facecolor='#333333', alpha=0.8)
+                ax_tetris.add_patch(rect_lost)
+                ax_tetris.text(puncture_start + (max_width-puncture_start)/2, max(50, total_time + 10)/2, "Fallback Loss\\n(Bandwidth Wasted)", color='#888888', ha='center', va='center', fontweight='bold')
+
+        for b in boxes:
+            rect = patches.Rectangle((b["x"], b["y"]), b["w"], b["h"], linewidth=1, edgecolor=grid_color, facecolor=b["c"], alpha=0.9)
+            ax_tetris.add_patch(rect)
+            
+            if "Legacy" in mac_mode and b["label"] != "Heavy 1":
+                actual_h = users[int(b['label'][-1])-1]["units"] * 100 / b["w"] if len(users) > 1 else b["h"]
+                if b["h"] > actual_h:
+                    rect_pad = patches.Rectangle((b["x"], b["y"] + actual_h), b["w"], b["h"] - actual_h, linewidth=0, facecolor='#555555', alpha=0.7, hatch='..')
+                    ax_tetris.add_patch(rect_pad)
+                    ax_tetris.text(b["x"] + b["w"]/2, b["y"] + actual_h + (b["h"] - actual_h)/2, "Padding\\n(Waste)", color='white', ha='center', va='center', fontsize=8)
+
+            if b["w"] > 10: 
+                ax_tetris.text(b["x"] + b["w"]/2, b["y"] + b["h"]/2, b["label"], color='black', ha='center', va='center', fontweight='bold', fontsize=9)
+
+        ax_tetris.set_xlabel("Frequency Bandwidth (MHz)", color=text_color)
+        ax_tetris.set_ylabel("Time (ms)", color=text_color)
+        ax_tetris.grid(True, linestyle=':', color=grid_color, alpha=0.5)
+        st.pyplot(fig_tetris)
+
+        fig_psd, ax_psd = plt.subplots(figsize=(10, 1.5))
+        f_axis = np.linspace(0, max_width, 1000)
+        
+        if "Legacy" in mac_mode and puncturing and max_width >= 80:
+            psd_val = np.where(f_axis <= effective_bw, 0.0, -60.0)
+        elif "OFDMA" in mac_mode and puncturing and max_width >= 80:
+            psd_val = np.where((f_axis > puncture_start) & (f_axis < puncture_end), -60.0, 0.0)
+        else:
+            psd_val = np.zeros_like(f_axis, dtype=float)
+
+        psd_val = psd_val + np.random.normal(0, 1.5, size=len(f_axis))
+        
+        ax_psd.plot(f_axis, psd_val, color='#ff007f', lw=1.5)
+        ax_psd.fill_between(f_axis, psd_val, -80, color='#ff007f', alpha=0.2)
+        
+        if puncturing and max_width >= 80:
+            ax_psd.axvspan(puncture_start, puncture_end, color='red', alpha=0.3, label="Interference Block")
+
+        ax_psd.set_xlim([0, max_width])
+        ax_psd.set_ylim([-80, 10])
+        ax_psd.set_yticks([])
+        ax_psd.set_xlabel("Frequency Bandwidth (MHz)", color=text_color)
+        st.pyplot(fig_psd)
+
+    # ==========================================
+    # Part 2: Micro View (Tone-Level Allocation)
+    # ==========================================
+    st.markdown("---")
+    st.markdown("#### 2. Micro View: Tone-Level RU Configurator (20 MHz Channel)")
+    st.markdown("Dive into the subcarrier level! See exactly how the 256 subcarriers in a 20MHz WiFi 6/7 channel are grouped into standard 26-tone, 52-tone, 106-tone, or 242-tone Resource Units.")
+
+    ru_pattern = st.selectbox("Select 802.11ax/be 20MHz RU Pattern:", [
+        "1x 242-tone (Single User SU)",
+        "2x 106-tone + 1x 26-tone (3 Users)",
+        "4x 52-tone + 1x 26-tone (5 Users)",
+        "Mixed: 106 + 26 + 52 + 2x26 (5 Users)",
+        "9x 26-tone (9 Dense IoT Users)"
+    ])
+
+    fig_ru, ax_ru = plt.subplots(figsize=(12, 2.5))
+    ax_ru.set_xlim([-130, 130])
+    ax_ru.set_ylim([0, 1.2])
+
+    # 繪製 DC Null 與 Guard Band
+    ax_ru.axvspan(-2, 2, color='#ff0000', alpha=0.5)
+    ax_ru.text(0, 1.05, "DC\\nNull", color='#ff0000', ha='center', va='center', fontsize=9, fontweight='bold')
+    ax_ru.axvspan(-130, -122, color='#555555', alpha=0.5)
+    ax_ru.axvspan(122, 130, color='#555555', alpha=0.5)
+    ax_ru.text(-126, 0.5, "Guard", color='white', ha='center', va='center', rotation=90)
+    ax_ru.text(126, 0.5, "Guard", color='white', ha='center', va='center', rotation=90)
+
+    def draw_ru(start, end, tones, color, label):
+        width = end - start
+        rect = patches.Rectangle((start, 0.1), width, 0.8, linewidth=1.5, edgecolor='#121212', facecolor=color, alpha=0.9)
+        ax_ru.add_patch(rect)
+        ax_ru.text(start + width/2, 0.5, f"{label}\\n({tones})", color='#121212', ha='center', va='center', fontweight='bold', fontsize=9)
+
+    colors = ['#00aaff', '#00ffcc', '#ffaa00', '#ff007f', '#aaff00', '#cc00ff', '#00ccff', '#ffcc00', '#ff5500']
+
+    if "242" in ru_pattern:
+        draw_ru(-122, -2, 121, colors[0], "User 1")
+        draw_ru(2, 122, 121, colors[0], "User 1")
+        ax_ru.plot([-60, 60], [1.05, 1.05], color=colors[0], lw=2)
+        ax_ru.text(0, 1.15, "1x 242-tone RU (User 1)", color=colors[0], ha='center', fontsize=11, fontweight='bold')
+        
+    elif "106-tone" in ru_pattern:
+        draw_ru(-122, -16, 106, colors[0], "U1")
+        draw_ru(-15, -2, 13, colors[1], "U2") 
+        draw_ru(2, 15, 13, colors[1], "U2")  
+        draw_ru(16, 122, 106, colors[2], "U3")
+        
+    elif "52-tone" in ru_pattern:
+        draw_ru(-122, -70, 52, colors[0], "U1")
+        draw_ru(-69, -17, 52, colors[1], "U2")
+        draw_ru(-16, -2, 13, colors[2], "U3")
+        draw_ru(2, 15, 13, colors[2], "U3")
+        draw_ru(16, 68, 52, colors[3], "U4")
+        draw_ru(69, 122, 52, colors[4], "U5")
+        
+    elif "9x 26-tone" in ru_pattern:
+        draw_ru(-122, -96, 26, colors[0], "U1")
+        draw_ru(-95, -69, 26, colors[1], "U2")
+        draw_ru(-68, -42, 26, colors[2], "U3")
+        draw_ru(-41, -15, 26, colors[3], "U4")
+        draw_ru(-14, -2, 13, colors[4], "U5")
+        draw_ru(2, 14, 13, colors[4], "U5")
+        draw_ru(15, 41, 26, colors[5], "U6")
+        draw_ru(42, 68, 26, colors[6], "U7")
+        draw_ru(69, 95, 26, colors[7], "U8")
+        draw_ru(96, 122, 26, colors[8], "U9")
+        
+    elif "Mixed" in ru_pattern:
+        draw_ru(-122, -16, 106, colors[0], "U1")
+        draw_ru(-15, -2, 13, colors[1], "U2")
+        draw_ru(2, 15, 13, colors[1], "U2")
+        draw_ru(16, 68, 52, colors[2], "U3")
+        draw_ru(69, 95, 26, colors[3], "U4")
+        draw_ru(96, 122, 26, colors[4], "U5")
+
+    ax_ru.set_xlabel("Subcarrier Index (256 FFT)", color=text_color, fontsize=11)
+    ax_ru.set_yticks([])
+    ax_ru.grid(axis='x', linestyle=':', color=grid_color, alpha=0.5)
+    st.pyplot(fig_ru)
 `
             }
         }, document.getElementById("root"));
