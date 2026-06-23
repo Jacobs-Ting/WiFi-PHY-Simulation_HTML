@@ -91,12 +91,12 @@ def calculate_evm_ser(rx_sym, tx_sym, constellation):
         errors += np.sum(np.abs(tx_chunk - detected_syms) > 1e-5)
     return evm_db, errors / len(tx_sym)
 
-def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple):
+def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc):
     rms_sig = np.sqrt(np.mean(np.abs(signal)**2)) + 1e-12
     v_in_rms = 10 ** ((pa_in_dbm - 30) / 20.0)
     scaled_in = signal * (v_in_rms / rms_sig)
     
-    # 1. PA Non-linearity & DPD
+    # 1. PA Non-linearity & DPD (Rapp Model)
     v_out_ideal = scaled_in * (10 ** (pa_gain_db / 20.0))
     p_sat_dbm = pa_p1db_dbm + 1.0 
     v_sat = 10 ** ((p_sat_dbm - 30) / 20.0)
@@ -123,31 +123,31 @@ def apply_rf_impairments(signal, phase_noise_deg, iq_amp_db, iq_phase_deg, pa_in
     Q_skewed = Q * np.cos(theta) - I * np.sin(theta)
     signal_iq = I + 1j * Q_skewed
     
-    # 3. Phase Noise (Time-domain random walk equivalent)
+    # ✨ 3. LO Leakage (DC Offset Carrier Leakage)
+    if lo_leakage_dbc > -80.0:
+        sig_pwr = np.mean(np.abs(signal_iq)**2) + 1e-12
+        lo_amp = np.sqrt(sig_pwr * (10 ** (lo_leakage_dbc / 10.0)))
+        signal_iq += lo_amp * np.exp(1j * np.pi / 4) # Add DC offset at 45 degree angle
+    
+    # 4. Phase Noise
     pn_rad = np.deg2rad(phase_noise_deg)
     phase_noise_array = np.random.randn(*signal_iq.shape) * pn_rad
     signal_out = signal_iq * np.exp(1j * phase_noise_array)
     
-    # ✨ 4. 新增: Filter Group Delay Ripple (Frequency-domain non-linear phase)
+    # 5. Filter Group Delay Ripple (Cubic Phase Distortion)
     if gd_ripple > 0.0:
         N_samples = len(signal_out)
-        # 如果是 1D 陣列 (Single link)
         if signal_out.ndim == 1:
             freqs = np.fft.fftfreq(N_samples)
-            norm_f = freqs / np.max(np.abs(freqs)) # 正規化頻率 -1 到 1
-            
-            # 三次方相位扭曲 (Cubic Phase) 導致邊緣子載波的群延遲呈拋物線急劇上升
+            norm_f = freqs / np.max(np.abs(freqs)) 
             phase_distortion = gd_ripple * (norm_f ** 3)
-            
             freq_domain = np.fft.fft(signal_out)
             freq_domain_distorted = freq_domain * np.exp(-1j * phase_distortion)
             signal_out = np.fft.ifft(freq_domain_distorted)
-        # 如果是 2D 陣列 (MU-MIMO 或 累積星座圖矩陣)
         else:
             freqs = np.fft.fftfreq(signal_out.shape[1])
             norm_f = freqs / np.max(np.abs(freqs))
             phase_distortion = gd_ripple * (norm_f ** 3)
-            
             freq_domain = np.fft.fft(signal_out, axis=1)
             freq_domain_distorted = freq_domain * np.exp(-1j * phase_distortion)
             signal_out = np.fft.ifft(freq_domain_distorted, axis=1)
@@ -169,29 +169,42 @@ def get_ofdm_params(phy_version):
     return N_FFT, CP_LEN, data_indices, pilot_indices
 
 @st.cache_data(show_spinner=False)
-def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple):
+def generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc):
     N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=len(data_indices))
+    
     ofdm_freq = np.zeros(N_FFT, dtype=complex)
     ofdm_freq[data_indices + N_FFT//2] = tx_symbols
     ofdm_freq[pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq)) * N_FFT
     tx_signal_clean = np.concatenate([ofdm_time[-CP_LEN:], ofdm_time])
-    tx_impaired = apply_rf_impairments(tx_signal_clean, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple)
+    
+    pad_factor = 4
+    fft_tx = np.fft.fftshift(np.fft.fft(tx_signal_clean))
+    pad_size = len(tx_signal_clean) * (pad_factor - 1) // 2
+    fft_tx_padded = np.pad(fft_tx, (pad_size, pad_size), 'constant')
+    tx_clean_up = np.fft.ifft(np.fft.ifftshift(fft_tx_padded)) * pad_factor
+    
+    tx_impaired_up = apply_rf_impairments(tx_clean_up, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc)
+    
+    tx_impaired = tx_impaired_up[::pad_factor]
+    
     papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2) / np.mean(np.abs(tx_impaired)**2))
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
     noise = np.sqrt(noise_power/2) * (np.random.randn(len(tx_impaired)) + 1j*np.random.randn(len(tx_impaired)))
+    
     rx_signal = tx_impaired + noise
     rx_ofdm_time = rx_signal[CP_LEN:]
     rx_ofdm_freq = np.fft.fftshift(np.fft.fft(rx_ofdm_time) / N_FFT)
     rx_symbols = rx_ofdm_freq[data_indices + N_FFT//2]
     evm, ser = calculate_evm_ser(rx_symbols, tx_symbols, constellation)
-    return tx_signal_clean, rx_signal, tx_symbols, rx_symbols, papr_db, evm, ser
+    
+    return tx_signal_clean, rx_signal, tx_symbols, rx_symbols, papr_db, evm, ser, tx_impaired_up
 
 @st.cache_data(show_spinner=False)
-def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple):
+def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc):
     N_FFT, CP_LEN, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=(num_syms, len(data_indices)))
@@ -199,7 +212,7 @@ def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, 
     ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
     ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
-    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple)
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc)
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
     noise = np.sqrt(noise_power/2) * (np.random.randn(*tx_impaired.shape) + 1j*np.random.randn(*tx_impaired.shape))
@@ -210,7 +223,7 @@ def generate_accumulated_constellation(phy_version, mod_type, snr_db, num_syms, 
     return rx_symbols_matrix.flatten(), evm, ser
 
 @st.cache_data(show_spinner=False)
-def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple):
+def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc):
     N_FFT, _, data_indices, pilot_indices = get_ofdm_params(phy_version)
     constellation = get_constellation(mod_type)
     tx_symbols = np.random.choice(constellation, size=(num_symbols_for_ccdf, len(data_indices)))
@@ -218,17 +231,17 @@ def generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg,
     ofdm_freq[:, data_indices + N_FFT//2] = tx_symbols
     ofdm_freq[:, pilot_indices + N_FFT//2] = np.array([1]*len(pilot_indices))
     ofdm_time = np.fft.ifft(np.fft.ifftshift(ofdm_freq, axes=1), axis=1) * N_FFT
-    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple)
+    tx_impaired = apply_rf_impairments(ofdm_time, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc)
     papr_db = 10 * np.log10(np.max(np.abs(tx_impaired)**2, axis=1) / np.mean(np.abs(tx_impaired)**2, axis=1))
     return np.sort(papr_db), 1.0 - np.arange(1, num_symbols_for_ccdf + 1) / num_symbols_for_ccdf
 
 @st.cache_data(show_spinner=False)
-def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple):
+def generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc):
     num_symbols = 40; barker_11 = np.array([1, -1, 1, 1, -1, 1, 1, 1, -1, -1, -1]); L_c = len(barker_11)
     constellation = np.array([1+1j, 1-1j, -1+1j, -1-1j])/np.sqrt(2) if "2 Mbps" in mod_type else np.array([1, -1])
     tx_symbols = np.random.choice(constellation, size=num_symbols)
     tx_waveform_clean = np.repeat(np.kron(tx_symbols, barker_11), 4)
-    tx_impaired = apply_rf_impairments(tx_waveform_clean, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple)
+    tx_impaired = apply_rf_impairments(tx_waveform_clean, pn_deg, iq_amp, iq_phs, pa_in, pa_gain, pa_p1db, dpd, gd_ripple, lo_leakage_dbc)
     sig_power = np.mean(np.abs(tx_impaired)**2)
     noise_power = sig_power / (10**(snr_db / 10))
     rx_waveform = tx_impaired + np.sqrt(noise_power/2) * (np.random.randn(len(tx_impaired)) + 1j*np.random.randn(len(tx_impaired)))
@@ -251,11 +264,10 @@ enable_dpd = st.sidebar.checkbox("✨ Enable DPD (Digital Pre-Distortion)", valu
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚠️ Baseband Impairments")
+lo_leakage_dbc = st.sidebar.slider("LO Leakage (dBc)", -80.0, -10.0, -80.0, 5.0, help="Carrier leakage at DC (center frequency) due to finite mixer isolation.")
 pn_deg = st.sidebar.slider("Phase Noise RMS (deg)", 0.0, 5.0, 0.0, step=0.1)
 iq_amp = st.sidebar.slider("IQ Amplitude Imbalance (dB)", 0.0, 3.0, 0.0, step=0.1)
 iq_phs = st.sidebar.slider("IQ Phase Mismatch (deg)", 0.0, 15.0, 0.0, step=0.5)
-
-# ✨ 新增: 濾波器群延遲變異拉桿
 gd_ripple = st.sidebar.slider("Filter Group Delay Ripple", 0.0, 5.0, 0.0, step=0.5, help="Simulates non-linear phase distortion at band edges (e.g., sharp anti-aliasing filter roll-off causing ICI).")
 
 if st.sidebar.button("🚀 Clear Cache & Rerun", use_container_width=True):
@@ -269,7 +281,7 @@ st.title(f"WiFi PHY & MAC Simulator")
 
 # Tabs Creation
 tab_single, tab_mlo, tab_waterfall, tab_hw, tab_budget, tab_mimo, tab_ofdma = st.tabs([
-    "📡 Single PHY", 
+    "📡 Single PHY (SEM)", 
     "🚀 MLO", 
     "🌊 Waterfall",
     "⚙️ STR/NSTR",
@@ -316,12 +328,27 @@ with tab_single:
         
         if "OFDM" in phy_mode:
             N_FFT, CP_LEN, data_idx_temp, _ = get_ofdm_params(phy_version)
-            tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
-            rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
-            sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
+            tx_clean, rx_signal, tx_sym, rx_sym_single, papr_db_snapshot, evm_single, ser_single, tx_impaired_up = generate_ofdm_data(phy_version, mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
+            rx_sym_accumulated, evm_acc, ser_acc = generate_accumulated_constellation(phy_version, mod_type, snr_db, num_accumulate, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
+            sorted_papr_db, ccdf_y = generate_ofdm_ccdf_data(phy_version, mod_type, num_symbols_for_ccdf, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
+            
+            fs_mhz = 20.0
+            oversample_factor = 4
+            n_up = len(tx_impaired_up)
+            freq_axis_up = np.linspace(-fs_mhz * oversample_factor / 2, fs_mhz * oversample_factor / 2, n_up)
+            
+            spectrum_up = np.fft.fftshift(np.fft.fft(tx_impaired_up)) / n_up
+            psd_db_up = 20 * np.log10(np.abs(spectrum_up) / np.max(np.abs(spectrum_up)) + 1e-12)
+            
+            mask_f = np.array([-40, -30, -20, -11, -9, 9, 11, 20, 30, 40])
+            mask_p = np.array([-45, -40, -28, -20, 0, 0, -20, -28, -40, -45])
+            
+            mask_interp = np.interp(freq_axis_up, mask_f, mask_p, left=-45, right=-45)
+            is_mask_violated = np.any((psd_db_up > mask_interp) & (np.abs(freq_axis_up) >= 9.0))
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Avg PA Output Power", f"{pa_out_avg:.1f} dBm", "- Compression Alert" if is_clipped else "+ Linear Region", delta_color="inverse" if is_clipped else "normal")
+            
             c2.metric("PAPR @ 0.1%", f"{sorted_papr_db[int(num_symbols_for_ccdf * 0.999)]:.2f} dB")
             c3.metric("EVM (RMS)", f"{evm_acc:.2f} dB")
             c4.metric("Symbol Error Rate", f"{ser_acc*100:.2f} %", delta="Errors!" if ser_acc > 0 else "Perfect", delta_color="inverse" if ser_acc > 0 else "normal")
@@ -337,13 +364,16 @@ with tab_single:
             with plot1: st.pyplot(fig1)
 
             fig2, ax2 = plt.subplots(figsize=(5, 3))
-            n_plot = N_FFT * 8 
-            spectrum = np.fft.fftshift(np.fft.fft(rx_signal, n=n_plot))
-            freq_axis = np.linspace(-10, 10, n_plot); ax2.set_xlim([-15, 15])
-            psd_db = 20 * np.log10(np.abs(spectrum) / np.max(np.abs(spectrum)) + 1e-10)
-            ax2.plot(freq_axis, psd_db, color='#ff007f')
-            ax2.set_title('Frequency Domain (PSD)')
-            ax2.set_ylim([-60, 5]); ax2.grid(True, color=grid_color, alpha=0.5)
+            ax2.plot(mask_f, mask_p, color='#ff0000', linestyle='--', linewidth=1.5, label='IEEE SEM Mask')
+            ax2.fill_between(mask_f, mask_p, 10, color='#ff0000', alpha=0.1)
+            
+            psd_color = '#ffaa00' if is_mask_violated else '#00ffcc'
+            ax2.plot(freq_axis_up, psd_db_up, color=psd_color, lw=1.2, label='Tx PSD (Oversampled)')
+            
+            ax2.set_xlim([-40, 40]); ax2.set_ylim([-60, 5])
+            ax2.set_title('Spectral Regrowth vs IEEE Mask')
+            ax2.grid(True, color=grid_color, alpha=0.5)
+            ax2.legend(loc='upper right', fontsize=8, facecolor=fig_bg_color, edgecolor=grid_color)
             with plot2: st.pyplot(fig2)
 
             fig3, ax3 = plt.subplots(figsize=(5, 3))
@@ -369,7 +399,7 @@ with tab_single:
             with plot4: st.pyplot(fig4)
             
         else:
-            rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
+            rx_waveform, rx_chips, tx_sym, rx_sym_accumulated, evm_acc, ser_acc = generate_dsss_data(mod_type, snr_db, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Avg PA Output Power", f"{pa_out_avg:.1f} dBm", "- Compression Alert" if is_clipped else "+ Linear Region", delta_color="inverse" if is_clipped else "normal")
@@ -418,7 +448,7 @@ with tab_mlo:
         l1_mod = st.selectbox("Link 1 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=1)
         l1_snr = st.slider("Link 1 SNR (dB)", -10, 45, 35, 1, key="l1_snr")
         l1_syms, l1_pt_s, l1_grid_s = get_plot_params(l1_mod)
-        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, l1_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
+        l1_rx_sym, l1_evm, l1_ser = generate_accumulated_constellation("HE", l1_mod, l1_snr, l1_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
         
         l1_base_mbps = get_mod_bits(l1_mod) * 146.47 
         l1_throughput = max(0, l1_base_mbps * ((1 - l1_ser) ** 5))
@@ -437,7 +467,7 @@ with tab_mlo:
         l2_mod = st.selectbox("Link 2 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=0)
         l2_snr = st.slider("Link 2 SNR (dB)", -10, 45, 40, 1, key="l2_snr")
         l2_syms, l2_pt_s, l2_grid_s = get_plot_params(l2_mod)
-        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, l2_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
+        l2_rx_sym, l2_evm, l2_ser = generate_accumulated_constellation("HE", l2_mod, l2_snr, l2_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
         
         l2_base_mbps = get_mod_bits(l2_mod) * 292.94 
         l2_throughput = max(0, l2_base_mbps * ((1 - l2_ser) ** 5))
@@ -456,7 +486,7 @@ with tab_mlo:
         l3_mod = st.selectbox("Link 3 Modulation", ["4096-QAM", "1024-QAM", "256-QAM", "64-QAM", "16-QAM", "QPSK", "BPSK"], index=2)
         l3_snr = st.slider("Link 3 SNR (dB)", -10, 45, 30, 1, key="l3_snr")
         l3_syms, l3_pt_s, l3_grid_s = get_plot_params(l3_mod)
-        l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, l3_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple)
+        l3_rx_sym, l3_evm, l3_ser = generate_accumulated_constellation("HE", l3_mod, l3_snr, l3_syms, pn_deg, iq_amp, iq_phs, pa_in_dbm, pa_gain_db, pa_p1db_dbm, enable_dpd, gd_ripple, lo_leakage_dbc)
         
         l3_base_mbps = get_mod_bits(l3_mod) * 17.2 
         l3_throughput = max(0, l3_base_mbps * ((1 - l3_ser) ** 5))
